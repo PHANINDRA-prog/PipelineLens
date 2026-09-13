@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Environments and secrets
+.venv/
+.env
+.env.*
+!.env.example
+gitlab-token.exe
+*.pem
+*.key
+
+# Local PipelineLens data
+.pipelinelens/
+data/
+artifacts/
+logs/
+local-corpus/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editors and operating systems
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

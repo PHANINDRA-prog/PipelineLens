@@ -1,0 +1,13 @@
+id: yaml-rule-mismatch
+version: 1
+title: CI rule or condition mismatch
+categories:
+  - yaml_rule_mismatch
+required_evidence:
+  - A skipped job and a rule or condition that did not match the run context
+safe_actions:
+  - Compare branch, event, and variable context against the rule.
+  - Verify dependencies were not skipped by the same condition.
+prohibited_actions:
+  - Remove protected deployment conditions without review.
+  - Make all jobs unconditional.

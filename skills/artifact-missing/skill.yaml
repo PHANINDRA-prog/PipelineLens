@@ -1,0 +1,13 @@
+id: artifact-missing
+version: 1
+title: Missing upstream CI artifact
+categories:
+  - artifact_missing
+required_evidence:
+  - Artifact download failure or an explicit missing expected path
+safe_actions:
+  - Verify the upstream artifact path and retention policy.
+  - Verify the downstream needs or dependencies relationship.
+prohibited_actions:
+  - Bypass artifact validation.
+  - Publish an empty replacement artifact.

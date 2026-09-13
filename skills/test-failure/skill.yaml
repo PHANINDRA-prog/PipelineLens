@@ -1,0 +1,13 @@
+id: test-failure
+version: 1
+title: Failing automated test
+categories:
+  - test_failure
+required_evidence:
+  - A named failing test, assertion, or test runner exit failure
+safe_actions:
+  - Reproduce the cited test command with the same dependency versions.
+  - Inspect the assertion and affected fixture or service dependency.
+prohibited_actions:
+  - Disable the test to unblock deployment.
+  - Raise a timeout without measuring the operation.

@@ -1,0 +1,15 @@
+id: deployment-api-failure
+version: 1
+title: External deployment API failure
+categories:
+  - deployment_failure
+  - external_api_failure
+  - timeout
+required_evidence:
+  - A deployment command plus an HTTP failure or timeout signal
+safe_actions:
+  - Verify target service health and idempotency before retrying.
+  - Check bounded retry behavior and the exact deployment request context.
+prohibited_actions:
+  - Retry indefinitely.
+  - Trigger a production deployment automatically.

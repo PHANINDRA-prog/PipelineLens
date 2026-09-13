@@ -1,0 +1,13 @@
+id: authentication-expired
+version: 1
+title: Expired or invalid CI credential
+categories:
+  - authentication_failure
+required_evidence:
+  - HTTP 401 response or explicit credential-expiration signal
+safe_actions:
+  - Verify credential expiry and protected-variable availability.
+  - Rotate the credential through the approved secret-management path.
+prohibited_actions:
+  - Display a credential value.
+  - Change credentials automatically.

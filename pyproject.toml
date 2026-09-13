@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipelinelens"
+version = "0.1.0"
+description = "Evidence-first, read-only CI failure analysis for GitHub Actions and GitLab CI/CD."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Phanindra PVS" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "pydantic>=2.9,<3",
+  "python-dotenv>=1.0,<2",
+  "redis>=5,<7",
+  "ruamel.yaml>=0.18,<1",
+  "sqlalchemy>=2.0,<3",
+  "streamlit>=1.39,<2",
+  "tenacity>=9,<10",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+cloud = [
+  "pgvector>=0.3,<1",
+  "psycopg[binary]>=3.2,<4",
+]
+worker = [
+  "dramatiq[redis]>=1.17,<2",
+]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.7,<1",
+]
+
+[project.scripts]
+pipelinelens-api = "pipelinelens.api.main:run"
+pipelinelens-dashboard = "pipelinelens.dashboard.app:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipelinelens"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/pipelinelens/dashboard/app.py" = ["E501"]
+"src/pipelinelens/demo.py" = ["E501"]
+"tests/test_providers.py" = ["E501"]
+"tests/test_yaml_graph.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pipelinelens"]
