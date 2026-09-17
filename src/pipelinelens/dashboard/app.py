@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 import re
+import socket
+import time
 from ipaddress import ip_address
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -24,6 +26,16 @@ from pipelinelens.services.pipeline_url import PipelineUrlError, parse_gitlab_ur
 from pipelinelens.services.redaction import redact_text
 
 API_URL = os.getenv("PIPELINELENS_API_URL", "http://localhost:8000")
+# "auto" (default): use API_URL if reachable, else self-host the API in this same
+# process so one `streamlit run` command works standalone (e.g. Streamlit Community
+# Cloud, or a dev machine that forgot to start the API separately). "never" keeps
+# today's two-process-only behavior; tests force this so no probe/thread ever runs.
+SELF_HOST_MODE = os.getenv("PIPELINELENS_SELF_HOST_API", "auto").strip().lower()
+_SELF_HOST_DISABLED = {"never", "0", "false", "off", "disabled"}
+_SELF_HOST_PROBE_ATTEMPTS = 8
+_SELF_HOST_PROBE_INTERVAL_SECONDS = 0.25
+_SELF_HOST_PROBE_TIMEOUT_SECONDS = 0.3
+_SELF_HOST_STARTUP_TIMEOUT_SECONDS = 15
 LOCAL = "/api/v1/local"
 MAX_TREE_ROWS = 280
 PAGE_LINES = 120
@@ -130,7 +142,71 @@ def _render_styles() -> None:
 
 def _api() -> PipelineLensApiClient:
     # Do not cache a client, request, response containing credentials, or token argument.
-    return PipelineLensApiClient(API_URL)
+    return PipelineLensApiClient(_resolved_api_url())
+
+
+def _api_url_reachable(url: str) -> bool:
+    """A bare TCP-connect probe: fast, no HTTP request, no route assumptions."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=_SELF_HOST_PROBE_TIMEOUT_SECONDS):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _start_self_hosted_api() -> str:
+    """Run the local API in a background thread of this same process, loopback-only.
+
+    Only reached when no external API answered ``API_URL``. The local-only request
+    guard in ``api/inspection.py`` is unchanged: it still requires a loopback client
+    and the ``X-PipelineLens-Local`` header, which this dashboard already sends.
+    """
+    import threading
+
+    import uvicorn
+
+    from pipelinelens.api.main import create_app
+
+    probe_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe_socket.bind(("127.0.0.1", 0))
+    port = probe_socket.getsockname()[1]
+    probe_socket.close()
+
+    config = uvicorn.Config(create_app(), host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(
+        target=server.run, name="pipelinelens-self-hosted-api", daemon=True,
+    )
+    thread.start()
+
+    url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + _SELF_HOST_STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _api_url_reachable(url):
+            break
+        time.sleep(_SELF_HOST_PROBE_INTERVAL_SECONDS)
+    return url
+
+
+def _resolve_api_url_once() -> str:
+    """Plain (uncached) resolution so tests can exercise it without a Streamlit context."""
+    if SELF_HOST_MODE in _SELF_HOST_DISABLED:
+        return API_URL
+    for attempt in range(_SELF_HOST_PROBE_ATTEMPTS):
+        if _api_url_reachable(API_URL):
+            return API_URL
+        if attempt < _SELF_HOST_PROBE_ATTEMPTS - 1:
+            time.sleep(_SELF_HOST_PROBE_INTERVAL_SECONDS)
+    return _start_self_hosted_api()
+
+
+@st.cache_resource(show_spinner="Starting the local PipelineLens API...")
+def _resolved_api_url() -> str:
+    """Resolve once per running process; every rerun and session reuses the result."""
+    return _resolve_api_url_once()
 
 
 def _md(value: object) -> str:

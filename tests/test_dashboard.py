@@ -379,6 +379,7 @@ class FakeApi:
 
 @pytest.fixture
 def ui(monkeypatch):
+    monkeypatch.setenv("PIPELINELENS_SELF_HOST_API", "never")
     api = FakeApi()
     monkeypatch.setattr(client_module, "PipelineLensApiClient", lambda base_url: api)
     at = AppTest.from_file(str(APP), default_timeout=15).run()
@@ -1493,17 +1494,104 @@ def test_child_finding_is_not_attributed_to_root_history_or_confirmation():
     assert not dashboard._root_finding(parent, {"job_id": "99"})
 
 
-def test_no_legacy_network_path_or_cached_token_client_remains():
+def test_no_legacy_network_path_or_cached_client_or_token_remains(monkeypatch):
     source = APP.read_text(encoding="utf-8")
     assert "/system/status" not in source
     assert "/pipeline-url/analyze" not in source
     assert "st.tabs(" not in source
-    assert "cache_resource" not in source and "cache_data" not in source
+    assert "cache_data" not in source  # Request/response data must never be cached.
     tree = ast.parse(source)
-    assert all(not node.decorator_list for node in tree.body if isinstance(node, ast.FunctionDef))
+    decorated = {
+        node.name: [ast.dump(decorator) for decorator in node.decorator_list]
+        for node in tree.body if isinstance(node, ast.FunctionDef) and node.decorator_list
+    }
+    # Only the plain, credential-free resolved API URL string may ever be cached
+    # across reruns; the client factory itself must stay undecorated and uncached.
+    assert set(decorated) == {"_resolved_api_url"}
+    assert all("cache_resource" in dump for dump in decorated["_resolved_api_url"])
+    monkeypatch.setattr(dashboard, "_resolved_api_url", lambda: dashboard.API_URL)
     first, second = dashboard._api(), dashboard._api()
     assert first is not second
     assert vars(first) == {"base_url": dashboard.API_URL.rstrip("/")}
+
+
+def test_self_host_never_mode_skips_every_probe_and_never_self_hosts(monkeypatch):
+    monkeypatch.setattr(dashboard, "SELF_HOST_MODE", "never")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("must not probe or self-host when explicitly disabled")
+
+    monkeypatch.setattr(dashboard, "_api_url_reachable", forbidden)
+    monkeypatch.setattr(dashboard, "_start_self_hosted_api", forbidden)
+
+    assert dashboard._resolve_api_url_once() == dashboard.API_URL
+
+
+def test_self_host_auto_mode_uses_the_reachable_external_api_unchanged(monkeypatch):
+    monkeypatch.setattr(dashboard, "SELF_HOST_MODE", "auto")
+    monkeypatch.setattr(dashboard, "_api_url_reachable", lambda url: True)
+
+    def forbidden():
+        raise AssertionError("must not self-host when the configured API is reachable")
+
+    monkeypatch.setattr(dashboard, "_start_self_hosted_api", forbidden)
+
+    assert dashboard._resolve_api_url_once() == dashboard.API_URL
+
+
+def test_self_host_auto_mode_falls_back_when_the_external_api_is_unreachable(monkeypatch):
+    monkeypatch.setattr(dashboard, "SELF_HOST_MODE", "auto")
+    monkeypatch.setattr(dashboard, "_api_url_reachable", lambda url: False)
+    monkeypatch.setattr(dashboard, "_SELF_HOST_PROBE_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(dashboard, "_start_self_hosted_api", lambda: "http://127.0.0.1:59999")
+
+    assert dashboard._resolve_api_url_once() == "http://127.0.0.1:59999"
+
+
+def test_self_host_disabled_synonyms_all_skip_self_hosting(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("must not probe or self-host when disabled")
+
+    monkeypatch.setattr(dashboard, "_api_url_reachable", forbidden)
+    monkeypatch.setattr(dashboard, "_start_self_hosted_api", forbidden)
+    for mode in ("never", "0", "false", "off", "disabled", "NEVER", " Off "):
+        monkeypatch.setattr(dashboard, "SELF_HOST_MODE", mode.strip().lower())
+        assert dashboard._resolve_api_url_once() == dashboard.API_URL
+
+
+def test_api_url_reachable_true_when_the_probe_connects(monkeypatch):
+    calls = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            return False
+
+    def fake_create_connection(address, timeout=None):
+        calls.append((address, timeout))
+        return FakeConnection()
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    assert dashboard._api_url_reachable("http://localhost:8000") is True
+    assert calls == [(("localhost", 8000), dashboard._SELF_HOST_PROBE_TIMEOUT_SECONDS)]
+
+
+def test_api_url_reachable_false_when_the_probe_is_refused(monkeypatch):
+    def fake_create_connection(address, timeout=None):
+        raise OSError("refused")
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    assert dashboard._api_url_reachable("http://localhost:8000") is False
+
+
+def test_api_url_reachable_false_for_an_unparseable_port(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("must not attempt a connection for a malformed URL")
+
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    assert dashboard._api_url_reachable("http://localhost:not-a-port") is False
 
 
 def mock_http(monkeypatch, handler):

@@ -96,6 +96,31 @@ The API binds to `127.0.0.1` and the dashboard calls localhost only. Paste a pip
 job, branch, file, or repository URL into `http://127.0.0.1:8501`.
 This stable Windows launch disables file watching; restart the dashboard after source edits.
 
+### Run with a single command instead
+
+The two processes above are optional. The dashboard can also run entirely standalone:
+
+```powershell
+cd C:\Users\phanindra.pvs\Desktop\RLP-SCRIPTS\PipelineLens
+$env:PYTHONPATH = "$PWD\src"
+C:\Python313\python.exe -m streamlit run src/pipelinelens/dashboard/app.py
+```
+
+(`PYTHONPATH` is only needed because this workstation uses the system Python without an editable
+install of the package; a `pip install -e .` environment, or Streamlit Community Cloud installing
+from `pyproject.toml`, does not need that line.)
+
+On first use, the dashboard checks whether `PIPELINELENS_API_URL` (default
+`http://localhost:8000`) already answers. If nothing is listening there, it starts the local API
+in a background thread of the same process instead, on an ephemeral loopback port, and uses that.
+Everything still runs on `127.0.0.1` only, and the same header/loopback checks in
+`api/inspection.py` still apply. This is what makes `streamlit run ...` alone work, including
+on Streamlit Community Cloud (see "Deployment" below).
+
+Set `PIPELINELENS_SELF_HOST_API=never` to keep the classic two-process-only behavior (the
+dashboard then always calls `PIPELINELENS_API_URL` directly and never starts a server itself).
+Automated tests always force `never` so no test ever opens a real socket or starts a real server.
+
 ## Paste a GitLab pipeline URL
 
 For a local self-hosted GitLab setup, add the following values to your ignored `.env` file:
@@ -387,6 +412,34 @@ C:\Python313\python.exe -m ruff check src tests
 For a public demo, use synthetic examples only. For company pipeline data, deploy only to an
 approved tenant with organization-approved authentication, storage, network, and incident-data
 controls. The local inspection endpoint is intentionally loopback-only and is not a public API.
+
+### Streamlit Community Cloud
+
+Streamlit Community Cloud only runs one process from one repository, so it uses the
+single-command self-host mode described under "Quick start" above.
+
+1. Push this repository to GitHub (a public demo should use synthetic pipelines only).
+2. In Streamlit Community Cloud, create a new app pointing at your repository/branch.
+3. Set the **Main file path** to `src/pipelinelens/dashboard/app.py`.
+4. Leave `PIPELINELENS_API_URL`/`PIPELINELENS_SELF_HOST_API` unset (defaults self-host the API
+   in-process automatically). To enable the opt-in cloud assist, open **Advanced settings** while
+   deploying (or **Settings > Secrets** on an already-deployed app) and add, as root-level TOML
+   keys so Streamlit also exposes them as real environment variables:
+
+   ```toml
+   PIPELINELENS_LLM_MODE = "gemini"
+   PIPELINELENS_LLM_API_KEY = "your-real-gemini-key-here"
+   ```
+
+   `.streamlit/secrets.toml.example` lists every supported key (cloud assist, GitLab
+   connection, API URL/self-host overrides) pre-filled and commented out, ready to copy from.
+   Leave both unset to keep the deployment fully local-only; the dashboard's cloud-assist
+   checkbox then simply stays disabled.
+5. Deploy. The first inspection request may take a few extra seconds while the in-process API
+   starts; subsequent requests reuse it for the lifetime of that app instance.
+
+The dashboard's own local corpus, saved-connection storage, and human-confirmed knowledge remain
+per-instance and are not shared across separate Streamlit Cloud viewers.
 
 ## Safety boundaries
 
