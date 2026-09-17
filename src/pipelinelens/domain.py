@@ -55,6 +55,7 @@ class CiConfigFile(BaseModel):
     content: str
     content_sha: str | None = None
     source_url: str | None = None
+    source_modified: bool = False
 
 
 class CiConfigAccessEntry(BaseModel):

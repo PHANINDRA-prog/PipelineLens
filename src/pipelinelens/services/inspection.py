@@ -40,6 +40,7 @@ from pipelinelens.services.findings import (
     analyze_change_risks,
     diagnose_job,
 )
+from pipelinelens.services.gitlab_artifacts import inspect_job_artifact
 from pipelinelens.services.gitlab_includes import normalize_local_path
 from pipelinelens.services.logs import redact_log
 from pipelinelens.services.pipeline_url import GitLabReference, PipelineUrlError, _origin
@@ -63,6 +64,7 @@ _MAX_FINDINGS = 80
 _MAX_NOTES = 100
 _MAX_DIFF_CHARS = 100_000
 _MAX_CONFIG_CHARS = 1_000_000
+_DATASYNC_JOB = re.compile(r"(?:^|[-_])datasync(?:[-_]|$)", re.IGNORECASE)
 
 
 class InspectionResult(BaseModel):
@@ -172,8 +174,14 @@ class _Scrubber:
         if isinstance(value, BaseModel):
             value = value.model_dump()  # Excluded raw metadata must never be traversed.
         if isinstance(value, dict):
-            return {self.text(str(name)): self.data(item, str(name))
-                    for name, item in value.items() if name != "raw"}
+            clean = {self.text(str(name)): self.data(item, str(name))
+                     for name, item in value.items() if name != "raw"}
+            if "source_modified" in value and "content" in value and "ref" in value:
+                clean["source_modified"] = bool(value["source_modified"]) or any(
+                    clean.get(name) != value.get(name)
+                    for name in ("content", "path", "ref", "source_url")
+                )
+            return clean
         if isinstance(value, (list, tuple)):
             return [self.data(item, key) for item in value]
         if isinstance(value, str):
@@ -207,6 +215,7 @@ class _Inspection:
         self.unavailable: set[str] = set()
         self.findings: list[Finding] = []
         self.sources: dict[tuple[str, str], asyncio.Task[ConfigInspection]] = {}
+        self._artifact_job_id: str | None = None
 
     def note(self, text: str) -> None:
         text = self.scrub.text(text)
@@ -226,12 +235,24 @@ class _Inspection:
 
     async def api(
         self, label: str, path: str, *, limit: int | None = None,
+        fallback_path: str | None = None,
     ) -> Any:
         async def request() -> Any:
-            response = await self.provider._request(
-                self.token, "GET", path,
-                params={"per_page": limit, "page": 1} if limit else None,
-            )
+            params = {"per_page": limit, "page": 1} if limit else None
+            try:
+                response = await self.provider._request(self.token, "GET", path, params=params)
+            except ProviderError as error:
+                if fallback_path is None or error.status_code not in {404, 405}:
+                    raise
+                self.note(
+                    f"Pipeline merge-request lookup returned HTTP {error.status_code}; "
+                    "checking commit-linked merge requests at the pipeline SHA instead."
+                )
+                # Only a failed fallback makes this optional evidence unavailable.
+                # Do not clear partial state belonging to other concurrent reads.
+                response = await self.provider._request(
+                    self.token, "GET", fallback_path, params=params,
+                )
             try:
                 payload = response.json()
             except json.JSONDecodeError:
@@ -274,6 +295,7 @@ class _Inspection:
             self.partial = True
             self.note(f"Oversized CI source {result.path} omitted at the source-size safety limit.")
             result.content = "[PIPELINELENS_CONFIG_OMITTED: source-size safety limit]"
+            result.source_modified = True
         return result
 
     async def load_sources(self, repository: RepositoryRef, run: PipelineRun) -> ConfigInspection:
@@ -355,6 +377,7 @@ class _Inspection:
             "Linked merge requests",
             f"{base}/pipelines/{quote(run.external_id, safe='')}/merge_requests",
             limit=2,
+            fallback_path=f"{base}/repository/commits/{quote(sha, safe='')}/merge_requests",
         )
         if not linked:
             self.note("No linked merge-request context was available. This is not a failure; "
@@ -510,6 +533,59 @@ class _Inspection:
                 "override that pipeline outcome. Review the status/policy discrepancy."
             )
         return finding
+
+    async def artifact_findings(
+        self,
+        repository: RepositoryRef,
+        job: PipelineJob,
+        *,
+        pipeline_successful: bool = False,
+    ) -> list[Finding]:
+        """Read one small, known DataSync artifact only when its job failed.
+
+        The artifact reader recognizes just a structured deploy summary and does
+        not inspect arbitrary archive contents. Its notes are evidence limits,
+        never a replacement for the terminal trace.
+        """
+        if (
+            self._artifact_job_id is not None
+            or _outcome(job) not in _FAILED
+            or not _DATASYNC_JOB.search(job.name)
+        ):
+            return []
+        self._artifact_job_id = job.external_id
+        archive = await self.read(
+            f"DataSync artifact for job {job.external_id}",
+            lambda: self.provider.fetch_job_artifact_archive(
+                self.token, repository, job.external_id,
+            ),
+        )
+        if archive is None:
+            return []
+        inspection = await asyncio.to_thread(
+            inspect_job_artifact,
+            archive,
+            job_web_url=self.job_url(repository, job),
+        )
+        for note in inspection.notes:
+            self.note(f"DataSync artifact: {note}")
+        findings = []
+        for finding in inspection.findings:
+            finding.job_id = job.external_id
+            if job.allow_failure:
+                finding.severity = "warning"
+                finding.explanation += (
+                    " This job has allow_failure=true; the artifact does not override "
+                    "the overall pipeline outcome."
+                )
+            elif pipeline_successful:
+                finding.severity = "warning"
+                finding.explanation += (
+                    " GitLab reports the overall pipeline successful; review the "
+                    "job status/policy discrepancy without overriding that outcome."
+                )
+            findings.append(self.scrub.model(finding))
+        return findings
 
     async def analyze_job(
         self, repository: RepositoryRef, run: PipelineRun, job: PipelineJob,
@@ -982,10 +1058,14 @@ async def inspect_gitlab(
                 )
     inspection.findings.extend(risks)
     analyses = []
+    artifact_findings: list[Finding] = []
     if run:
         for job, trace in zip(chosen, traces, strict=True):
             analyses.append(await inspection.analyze_job(
                 repository, run, job, usable, trace, known,
+            ))
+            artifact_findings.extend(await inspection.artifact_findings(
+                repository, job, pipeline_successful=_outcome(run) in _SUCCESS,
             ))
         skipped_failed = [job for job in jobs if _outcome(job) in _FAILED and job not in chosen]
         if skipped_failed:
@@ -1007,6 +1087,7 @@ async def inspect_gitlab(
         repository, run, bridges, budget - len(chosen),
     ) if run else ([], [], 0)
     analyses.extend(child_analyses)
+    inspection.findings.extend(artifact_findings)
     if configuration_only:
         status = "configuration_only"
     elif run and _outcome(run) in _FAILED:
@@ -1036,6 +1117,7 @@ async def inspect_gitlab(
     inspection.findings.sort(key=lambda finding: (
         {"error": 0, "warning": 1, "info": 2}[finding.severity],
         {"observed": 0, "likely": 1, "unknown": 2}[finding.confidence],
+        finding.rule_id in {"deployment.failed", "pipeline.failed"},
         finding.rule_id, finding.job_id or "",
     ))
     if len(inspection.findings) > _MAX_FINDINGS:

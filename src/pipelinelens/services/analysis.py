@@ -74,10 +74,14 @@ class PipelineAnalyzer:
     def _redact_configs(self, configs: list[CiConfigFile]) -> list[CiConfigFile]:
         """Ensure CI YAML is sanitized before parsing, display, retrieval, or serialization."""
 
-        return [
-            config.model_copy(update={"content": self.redactor.redact(config.content).content})
-            for config in configs
-        ]
+        output = []
+        for config in configs:
+            content = self.redactor.redact(config.content).content
+            output.append(config.model_copy(update={
+                "content": content,
+                "source_modified": config.source_modified or content != config.content,
+            }))
+        return output
 
     def analyze_input(
         self, analysis_input: AnalysisInput, similar_incidents: Iterable[SimilarIncident] = ()

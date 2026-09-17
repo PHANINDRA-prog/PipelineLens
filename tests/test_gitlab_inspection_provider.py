@@ -54,6 +54,137 @@ def provider_for(handler):
     return GitLabProvider(ORIGIN, transport=httpx.MockTransport(guarded))
 
 
+class _UnreadableStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.iterated = False
+
+    async def __aiter__(self):
+        self.iterated = True
+        yield b"this body must not be read"
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_artifact_archive_uses_one_bounded_same_api_get() -> None:
+    archive = b"PK\x03\x04fixture"
+
+    def handler(request):
+        assert request.url.path == "/api/v4/projects/42/jobs/182518438/artifacts"
+        assert request.url.query == b""
+        assert request.headers["accept"] == "application/zip"
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(200, content=archive, headers={"content-length": str(len(archive))})
+
+    result = await provider_for(handler).fetch_job_artifact_archive(
+        "test-token", repository(), "182518438"
+    )
+
+    assert result == archive
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_artifact_archive_checks_declared_size_before_reading_the_body() -> None:
+    stream = _UnreadableStream()
+
+    def handler(request):
+        return httpx.Response(200, stream=stream, headers={"content-length": "6"})
+
+    with pytest.raises(ProviderError) as error:
+        await provider_for(handler).fetch_job_artifact_archive(
+            "test-token", repository(), "182518438", max_bytes=5
+        )
+
+    assert error.value.status_code == 413
+    assert stream.iterated is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_bytes", [0, -1, 2 * 1024 * 1024 + 1, True, "1024"])
+async def test_fetch_job_artifact_archive_rejects_invalid_limits_without_a_request(
+    max_bytes,
+) -> None:
+    def handler(request):
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    with pytest.raises(ProviderError) as error:
+        await provider_for(handler).fetch_job_artifact_archive(
+            "test-token", repository(), "182518438", max_bytes=max_bytes
+        )
+
+    assert error.value.status_code == 400
+    assert "test-token" not in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_id", ["", "0", "-1", "1825/18438", "a" * 21])
+async def test_fetch_job_artifact_archive_rejects_invalid_job_ids_without_a_request(
+    job_id: str,
+) -> None:
+    def handler(request):
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    with pytest.raises(ProviderError) as error:
+        await provider_for(handler).fetch_job_artifact_archive(
+            "test-token", repository(), job_id
+        )
+
+    assert error.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_artifact_archive_rejects_declared_or_actual_oversize_response() -> None:
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, content=b"small", headers={"content-length": "6"})
+        assert "content-length" not in request.headers
+        return httpx.Response(200, content=b"12345")
+
+    provider = provider_for(handler)
+    with pytest.raises(ProviderError) as declared_error:
+        await provider.fetch_job_artifact_archive("test-token", repository(), "182518438", 5)
+    with pytest.raises(ProviderError) as actual_error:
+        await provider.fetch_job_artifact_archive("test-token", repository(), "182518438", 4)
+
+    assert declared_error.value.status_code == actual_error.value.status_code == 413
+    assert "test-token" not in str(declared_error.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_artifact_archive_rejects_malformed_length_without_echoing_it() -> None:
+    malformed_length = "not-a-size"
+
+    def handler(request):
+        return httpx.Response(200, content=b"archive", headers={"content-length": malformed_length})
+
+    with pytest.raises(ProviderError) as error:
+        await provider_for(handler).fetch_job_artifact_archive(
+            "test-token", repository(), "182518438"
+        )
+
+    assert error.value.status_code == 502
+    assert malformed_length not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_artifact_archive_rejects_redirects() -> None:
+    def handler(request):
+        return httpx.Response(302, headers={"location": "https://other.test/artifacts"})
+
+    with pytest.raises(ProviderError) as error:
+        await provider_for(handler).fetch_job_artifact_archive(
+            "test-token", repository(), "182518438"
+        )
+
+    assert error.value.status_code == 302
+    assert "other.test" not in str(error.value)
+
+
 def test_repository_and_job_populate_new_domain_fields() -> None:
     empty_config = GitLabProvider._repository(
         project_payload(407446, "group/rlp", ci_config_path="")

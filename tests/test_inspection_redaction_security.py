@@ -381,9 +381,16 @@ async def test_actual_inspection_scrubs_before_analyzer_response_and_model_cache
     assert result.repository.ci_config_path
     assert "config.invalid/root.yml" in result.repository.ci_config_path
     cache = _ResultCache()
-    cache.put("fixture", result, "2026-09-13T00:00:00+00:00")
-    cached = cache.get("fixture")
-    assert cached is not None and cached.result is not result
+    # An external/unverifiable source must be reread, not authorized by root access.
+    assert not cache.put("fixture", result, "2026-09-13T00:00:00+00:00")
+    assert cache.get("fixture") is None
+    local = result.model_copy(deep=True)
+    local.repository.ci_config_path = ".gitlab-ci.yml"
+    local.ci_config_access.entries[0].path = local.config_bundle[0].path
+    local.ci_config_access.entries[0].source_url = local.config_bundle[0].source_url
+    assert cache.put("root-only", local, "2026-09-13T00:00:00+00:00")
+    cached = cache.get("root-only")
+    assert cached is not None and cached.result is not local
     _assert_no_secrets(cached.result.model_dump_json(), secrets)
     assert OPAQUE in provider.config.content
 

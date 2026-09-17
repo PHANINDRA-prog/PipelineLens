@@ -1,0 +1,2 @@
+# Keep the POSIX entrypoint usable after Windows checkouts.
+/docker-entrypoint.sh text eol=lf

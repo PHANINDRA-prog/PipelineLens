@@ -12,12 +12,16 @@ from typing import Any
 
 import httpx
 import pytest
+from dotenv import main as dotenv_main
 from streamlit.testing.v1 import AppTest
 
-from pipelinelens.dashboard import app as dashboard
-from pipelinelens.dashboard import client as client_module
-from pipelinelens.dashboard.client import ApiClientError, PipelineLensApiClient
-from pipelinelens.services.inspection import InspectionResult
+# Importing application types must not read the user's .env, even during collection.
+with pytest.MonkeyPatch.context() as import_guard:
+    import_guard.setattr(dotenv_main.DotEnv, "dict", lambda self: {})
+    from pipelinelens.dashboard import app as dashboard
+    from pipelinelens.dashboard import client as client_module
+    from pipelinelens.dashboard.client import ApiClientError, PipelineLensApiClient
+    from pipelinelens.services.inspection import InspectionResult
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "src/pipelinelens/dashboard/app.py"
@@ -36,6 +40,136 @@ FIXES = [
     "Retry manually only after connectivity is restored.",
     "Additional diagnostic step belongs in collapsed details.",
 ]
+SOURCE_PATH = "src/request.json"
+SOURCE_URL = f"{PROJECT}/-/blob/{SHA}/{SOURCE_PATH}"
+SOURCE_TEXT = '{\n  "sobject": "accounts.csv",\n  "records": [{"Name": "Sample"}]\n}\n'
+SOURCE_DIFF = (
+    f"--- a/{SOURCE_PATH}\n"
+    f"+++ b/{SOURCE_PATH}\n"
+    "@@ -1,4 +1,4 @@\n"
+    " {\n"
+    '-  "sobject": "accounts.csv",\n'
+    '+  "sobject": "Account",\n'
+    '   "records": [{"Name": "Sample"}]\n'
+    " }\n"
+)
+VERIFY = [
+    "Validate the JSON and confirm Account is the intended object API name.",
+    "Run the existing request fixture test against this commit.",
+]
+CONDITION = "Only if these records are intended for the Account object."
+DOC_URL = "https://docs.gitlab.com/runner/faq/#check-the-runner"
+SUMMARY_PATH = "datasync/deploy-summary.json"
+SUMMARY_URL = f"{PROJECT}/-/jobs/7/artifacts/file/{SUMMARY_PATH}"
+SUMMARY_COUNTERS = (
+    "DataSync deploy summary counters: DataSync deploy: count=3, failedCount=0; "
+    "field mappings: deployed=12, failed=1, skipped=897; "
+    "object mappings: updated=3; value transformations: failed=0. "
+)
+
+
+def remediation_fixture(rule_id="runner.ssh_executor_unavailable", job_id="7") -> dict:
+    return {
+        "job_id": job_id, "rule_id": rule_id,
+        "summary": "Runner preparation could not reach its SSH executor.",
+        "cause_confidence": 91, "fix_confidence": 28, "score_label": dashboard.SCORE_LABEL,
+        "confidence_basis": [
+            "The runner diagnostic identifies a TCP timeout before the script ran.",
+            "Runner network settings and a restored route were not verified.",
+        ],
+        "proposals": [], "source_blocks": [],
+        "actions": ["Inspect the diagnostic."],
+        "missing_information": ["Runner network route and executor health."],
+        "documentation": [DOC_URL],
+    }
+
+
+def use_source_proposal(api: FakeApi, *, fix_confidence=82) -> dict:
+    finding = api.result["findings"][1]
+    finding.update(
+        rule_id="salesforce.csv_as_sobject", category="request_validation",
+        title="CSV filename was passed as a Salesforce object",
+        explanation=(
+            "The sobject field contains a CSV path instead of a Salesforce object API name."
+        ),
+        fix=["Confirm the intended object API name, not the CSV input filename."],
+        evidence=[{
+            "text": "Unknown sObject: accounts.csv", "path": SOURCE_PATH, "line": 2,
+            "source_url": SOURCE_URL + "#L2",
+        }],
+    )
+    remediation = remediation_fixture(finding["rule_id"], finding["job_id"])
+    remediation.update(
+        summary=finding["explanation"], fix_confidence=fix_confidence,
+        confidence_basis=[
+            "Exact JSON input and quoted sObject diagnostic compared at the run commit.",
+        ],
+        proposals=[{
+            "kind": "source_diff", "title": "Use the Account object API name",
+            "path": SOURCE_PATH, "ref": SHA, "source_url": SOURCE_URL,
+            "diff": SOURCE_DIFF, "condition": CONDITION,
+            "rationale": (
+                "Preserve all record values and change only the object name if Account is intended."
+            ),
+            "verification": VERIFY,
+        }],
+        source_blocks=[{
+            "path": SOURCE_PATH, "ref": SHA, "source_url": SOURCE_URL,
+            "line_start": 1, "line_end": 4, "content": SOURCE_TEXT, "language": "json",
+        }],
+        documentation=["https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/overview#security-information"],
+    )
+    api.result["remediations"] = [remediation]
+    return remediation
+
+
+def use_deployment_summary(api: FakeApi, *, rule="connection_reset") -> dict:
+    reset = rule == "connection_reset"
+    finding = api.result["findings"][1]
+    finding.update(
+        rule_id=f"rlp.datasync_field_mapping_{rule}", severity="error",
+        category="deployment_transport_failure" if reset else "deployment_failure",
+        title="DataSync field mapping deployment " + (
+            "encountered a connection reset" if reset else "recorded a failure"
+        ),
+        explanation=(
+            "The deployment summary records a field-mapping failure. "
+            "The underlying network cause is not established." if reset else
+            "The deployment summary records a field-mapping failure without a specific cause."
+        ),
+        fix=[
+            "Review target-platform service diagnostics for this deployment.",
+            "Confirm partial target state before a controlled retry.",
+        ],
+        evidence=[
+            {"text": "Process exited with code 1.", "source_url": f"{PROJECT}/-/jobs/7"},
+            {
+                "path": SUMMARY_PATH, "source_url": SUMMARY_URL,
+                "text": SUMMARY_COUNTERS + (
+                    "A bounded actual field-mapping failure reports a connection reset."
+                    if reset else "A bounded actual field-mapping failure has no recognized "
+                    "safe error classification."
+                ),
+            },
+        ],
+        confidence="observed" if reset else "unknown", owner="DataSync / target platform",
+    )
+    api.result["status"] = "failed"
+    api.result["pipeline"]["status"] = "failed"
+    api.result["jobs"][0].update(name="deploy-datasync", allow_failure=False)
+    api.result["analyses"][0]["job"] = deepcopy(api.result["jobs"][0])
+    api.result["analyses"][0]["redacted_log"] = "Starting deployment\nProcess exited with code 1."
+    remediation = remediation_fixture(finding["rule_id"], finding["job_id"])
+    config = api.result["config_bundle"][0]
+    remediation.update(
+        summary=finding["explanation"], cause_confidence=94 if reset else 30,
+        fix_confidence=15 if reset else 10,
+        confidence_basis=["Deployment artifact records the failure, not a verified fix."],
+        missing_information=["Target diagnostics and partial-state verification."],
+        source_blocks=[{**config, "line_start": 1, "line_end": 2, "language": "yaml"}],
+    )
+    api.result["remediations"] = [remediation]
+    return remediation
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +180,7 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(socket.socket, "connect", denied)
     monkeypatch.setattr(socket.socket, "connect_ex", denied)
+    monkeypatch.setattr(dotenv_main.DotEnv, "dict", lambda self: {})
 
 
 def response_fixture() -> dict[str, Any]:
@@ -179,6 +314,10 @@ def response_fixture() -> dict[str, Any]:
         "knowledge_saved": True,
         "knowledge_summary": {"projects": 1, "observations": 2, "confirmed_resolutions": 0},
         "confirmed_resolutions": [], "mode": "local_rules",
+        "remediations": [remediation_fixture()],
+        "corpus_matches": {
+            "runner.ssh_executor_unavailable": {"seen_failed_pipelines": 3, "failed_jobs": 4},
+        },
     }
 
 
@@ -215,6 +354,7 @@ class FakeApi:
             raise self.errors[path]
         if path == f"{LOCAL}/inspect":
             result = deepcopy(self.result)
+            result["knowledge_saved"] = bool(payload.get("remember_analysis", True))
             if payload.get("remember_token"):
                 self.status["saved_connections"] = [{
                     "id": CREDENTIAL_ID, "host": HOST, "projects": ["group/sample"],
@@ -278,6 +418,24 @@ def rendered_text(at: AppTest) -> str:
     return "\n".join(str(item.value) for kind in kinds for item in at.get(kind))
 
 
+def answer_elements(at: AppTest) -> list:
+    flat = list(at.main)
+    start = next(index for index, item in enumerate(flat) if item.type == "subheader")
+    end = next(index for index, item in enumerate(flat)
+               if item.type == "expander" and item.label == "Evidence & details")
+    return flat[start:end]
+
+
+def answer_text(at: AppTest) -> str:
+    kinds = {"markdown", "caption", "subheader", "code", "warning"}
+    return literal("\n".join(str(item.value) for item in answer_elements(at)
+                            if item.type in kinds))
+
+
+def outer_expanders(at: AppTest) -> list[str]:
+    return [item.label for item in at.main.children.values() if item.type == "expander"]
+
+
 def literal(value: str) -> str:
     return re.sub(r"\\(.)", r"\1", value)
 
@@ -285,17 +443,37 @@ def literal(value: str) -> str:
 def test_initial_ui_is_local_only_no_eager_memory_or_model_calls(ui):
     at, api = ui
     assert api.calls == [("GET", f"{LOCAL}/status", None)]
-    assert any(item.value == "Local rules • no external AI calls" for item in at.info)
-    assert [tab.label for tab in at.tabs] == [
-        "Diagnosis", "Pipeline context", "CI sources & files", "Local memory",
-    ]
+    assert any(
+        "optional cloud assist stays off unless you turn it on" in item.value
+        for item in at.caption
+    )
+    assert not at.info and not at.tabs
     assert not at.sidebar.radio
     assert at.radio(key="connection_mode").value == "auto"
-    assert not at.radio(key="connection_mode").proto.form_id
+    assert at.radio(key="connection_mode").proto.form_id == "inspect-link"
     assert at.text_input(key="read_only_token").proto.form_id == "inspect-link"
+    options = next(item for item in at.expander if item.label == "Connection & options")
+    assert options.text_input[0].key == "read_only_token"
+    assert at.text_input(key="inspection_url").label == "GitLab link"
     assert not at.checkbox(key="remember_token").value
+    assert at.checkbox(key="remember_analysis").value
+    assert at.checkbox(key="remember_analysis").label == "Save diagnostic notes locally"
+    assert at.checkbox(key="remember_analysis").proto.form_id == "inspect-link"
+    assert options.checkbox(key="remember_analysis").value
+    assert dashboard.LOCAL_NOTES_NOTICE in rendered_text(at)
+    assert outer_expanders(at) == ["Settings"]
+    assert not at.metric
     assert not at.get("download_button")
     assert all(not item.proto.expanded for item in at.expander)
+
+
+def test_missing_connection_keeps_minimal_options_collapsed(ui):
+    at, api = ui
+    api.status.update(configured_connection=False, saved_connections=[])
+    at.run()
+    assert not at.exception
+    assert all(not item.proto.expanded for item in at.expander)
+    assert not at.tabs and not api.posted()
 
 
 @pytest.mark.parametrize("enter", [False, True], ids=["Analyze", "Enter-trigger"])
@@ -307,13 +485,15 @@ def test_submission_retains_url_clears_only_password_and_keeps_settings(ui, ente
     submit(at, PIPELINE, TOKEN, enter=enter)
     assert api.posted() == [{
         "url": PIPELINE, "token": TOKEN, "connection": "request",
-        "remember_token": True, "refresh": True, "max_jobs": 5,
+        "remember_token": True, "remember_analysis": True, "refresh": True, "max_jobs": 5,
+        "ask_cloud_ai": False,
     }]
     assert at.text_input(key="inspection_url").value == PIPELINE
     assert at.text_input(key="read_only_token").value == ""
     assert at.radio(key="connection_mode").value == "request"
     assert at.checkbox(key="remember_token").value
     assert at.checkbox(key="force_refresh").value
+    assert at.checkbox(key="remember_analysis").value
     assert not at.get("form")[0].proto.form.clear_on_submit
     assert TOKEN not in json.dumps(at.session_state.filtered_state)
     assert TOKEN not in rendered_text(at)
@@ -332,7 +512,7 @@ def test_supported_url_kinds_use_new_inspection_endpoint(ui, suffix):
     submit(at, url)
     assert api.posted()[0] == {
         "url": url, "connection": "auto", "remember_token": False,
-        "refresh": False, "max_jobs": 5,
+        "remember_analysis": True, "refresh": False, "max_jobs": 5, "ask_cloud_ai": False,
     }
     assert at.text_input(key="inspection_url").value == url
     assert at.session_state.inspection_result["submitted_url"] == url
@@ -367,23 +547,38 @@ def test_unavailable_windows_vault_disables_save_and_never_sends_consent(ui):
     assert "New tokens will not be saved" in rendered_text(at)
 
 
-def test_connection_radio_updates_disabled_fields_without_submission(ui):
+def test_configured_selection_ignores_token_and_clears_it_after_submission(ui):
     at, api = ui
     at.text_input(key="inspection_url").input(PIPELINE).run()
     at.text_input(key="read_only_token").input(TOKEN).run()
     at.radio(key="connection_mode").set_value("configured").run()
-    assert at.text_input(key="read_only_token").disabled
-    assert at.text_input(key="read_only_token").value == ""
-    assert at.checkbox(key="remember_token").disabled
+    # Form widgets are batched; no stale disabled state relies on an unseen rerun.
+    assert not at.text_input(key="read_only_token").disabled
+    assert at.text_input(key="read_only_token").value == TOKEN
     assert at.text_input(key="inspection_url").value == PIPELINE
     assert not api.posted()
     submit(at)
     assert "token" not in api.posted()[0]
+    assert not api.posted()[0]["remember_token"]
     assert api.posted()[0]["connection"] == "configured"
+    assert at.text_input(key="read_only_token").value == ""
+    assert TOKEN not in json.dumps(at.session_state.filtered_state)
     at.radio(key="connection_mode").set_value("request").run()
     assert not at.text_input(key="read_only_token").disabled
     assert not at.checkbox(key="remember_token").disabled
     assert at.text_input(key="inspection_url").value == PIPELINE
+
+
+def test_configured_mode_cannot_retain_a_token_pasted_into_the_url(ui):
+    at, api = ui
+    at.radio(key="connection_mode").set_value("configured").run()
+    submit(at, f"{PROJECT}/-/blob/{TOKEN}/.gitlab-ci.yml", TOKEN)
+    assert at.session_state.submission_failed
+    assert not api.posted()
+    assert at.text_input(key="inspection_url").value == ""
+    assert at.text_input(key="read_only_token").value == ""
+    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in rendered_text(at)
 
 
 @pytest.mark.parametrize("url", [
@@ -399,12 +594,13 @@ def test_invalid_selection_clears_stale_result_but_not_url(ui, url):
     submit(at, url, TOKEN)
     assert at.session_state.submission_failed is True
     assert at.session_state.inspection_result is None
-    assert at.text_input(key="inspection_url").value == url
+    assert at.text_input(key="inspection_url").value == dashboard._url_to_keep(url, TOKEN)
     assert at.text_input(key="read_only_token").value == ""
     assert len(api.posted()) == 1
     assert not at.subheader
     assert "Previous results were cleared" in rendered_text(at)
     assert TOKEN not in rendered_text(at)
+    assert TOKEN not in json.dumps(at.session_state.filtered_state)
 
 
 @pytest.mark.parametrize("selection", ["missing-token", "different-host", "unconfigured"])
@@ -460,27 +656,88 @@ def test_unavailable_status_does_not_echo_error_or_prevent_request_token(ui):
     assert at.session_state.inspection_result
 
 
-def test_causal_job_answer_fixes_and_exact_quote_precede_all_collapsed_details(ui):
+def test_causal_answer_is_concise_with_one_numbered_list_and_one_details_section(ui):
     at, _ = ui
     submit(at)
-    assert at.subheader[0].value == "Warning · " + TITLE
-    flat = list(at.main)
-    first_detail = next(index for index, item in enumerate(flat) if item.type == "expander")
-    before_details = flat[:first_detail]
-    text = "\n".join(str(item.value) for item in before_details
-                     if item.type in {"markdown", "code", "subheader", "caption"})
-    assert "**Why**" in text
-    assert "Probable correct fix" in text
-    for index, fix in enumerate(FIXES[:3], 1):
-        assert f"{index}. {fix}" in literal(text)
-    assert FIXES[3] not in literal(text)
-    assert QUOTE in text
-    assert f"{PROJECT}/-/jobs/7#L2" in text
-    assert "Observed evidence" in text and "Owner: Runner / infrastructure team" in text
+    assert at.subheader[0].value == TITLE
+    text = answer_text(at)
+    numbered = [literal(item.value) for item in answer_elements(at)
+                if item.type == "markdown" and item.value.startswith("1. ")]
+    assert numbered == ["\n".join(f"{index}. {fix}" for index, fix in enumerate(FIXES[:3], 1))]
+    assert FIXES[3] not in text
+    assert "No verified source patch" in text
+    assert QUOTE not in text and "CI definition" not in text
+    assert QUOTE in rendered_text(at)  # Available only in collapsed evidence/logs.
+    assert not at.tabs
+    assert outer_expanders(at) == ["Evidence & details"]
+    assert [item.label for item in at.metric] == ["Cause confidence", "Fix confidence"]
+    assert [item.value for item in at.metric] == ["91/100", "28/100"]
+    assert all(dashboard.SCORE_LABEL in item.proto.help for item in at.metric)
+    assert all("No target verification" in item.proto.help for item in at.metric)
+    assert DOC_URL in text
+    assert "https://docs.gitlab.com/runner/faq/" in text
     assert "Legacy prose" not in rendered_text(at)
     assert "96%" not in rendered_text(at)
     assert all(not item.proto.expanded for item in at.expander)
-    assert "Other findings (2)" in [item.label for item in at.expander]
+    details = next(item for item in at.expander if item.label == "Evidence & details")
+    detail_labels = [item.label for item in details.expander]
+    assert "Raw redacted logs (bounded view)" in detail_labels
+    assert "Merge requests & changed files (static checks)" in detail_labels
+    assert "CI source files (bounded view)" in detail_labels
+    assert "Local settings & history" in detail_labels
+    assert "Local history: 3 failed pipelines" in rendered_text(at)
+    assert "Local history:" not in text
+    assert not any(item.key.startswith("issue-") for item in at.selectbox)
+
+
+def test_concrete_static_path_risk_precedes_visibility_and_success_context(ui):
+    at, api = ui
+    api.result["findings"] = [api.result["findings"][0], api.result["findings"][2], {
+        "rule_id": "change.ci_path_case_mismatch", "category": "repository_path_risk",
+        "severity": "warning", "title": "Repository path case mismatch",
+        "explanation": "Static case mismatch; this does not prove a failed deployment.",
+        "fix": ["Compare the intended package path and its case at the run commit."],
+        "evidence": [], "confidence": "observed", "owner": "CI / package owner",
+    }]
+    submit(at)
+    assert at.subheader[0].value == "Repository path case mismatch"
+    assert "Static case mismatch" in literal(rendered_text(at))
+
+
+def test_failed_job_without_known_cause_precedes_successful_sibling_warning(ui):
+    at, api = ui
+    api.result["findings"] = [api.result["findings"][1], {
+        "rule_id": "log.explicit_error", "category": "unknown", "severity": "error",
+        "title": "Failed job needs diagnostic review", "explanation": "Exit cause unknown.",
+        "fix": ["Read the failed command diagnostic."], "evidence": [],
+        "job_id": "9", "confidence": "unknown", "owner": "Job owner",
+    }]
+    api.result["status"] = "failed"
+    api.result["pipeline"]["status"] = "failed"
+    submit(at)
+    assert at.subheader[0].value == "Failed job needs diagnostic review"
+
+
+def test_successful_job_with_partial_sources_does_not_lead_with_access_noise(ui):
+    at, api = ui
+    api.result["findings"] = [api.result["findings"][0], api.result["findings"][2]]
+    api.result["jobs"] = api.result["jobs"][1:]
+    submit(at)
+    assert "No failure observed" in at.subheader[0].value
+    assert "Pipeline passed · inspection warning" in answer_text(at)
+    assert any("CI visibility is partial" in literal(item.label) for item in at.expander)
+
+
+def test_causal_quote_is_not_repeated_in_the_short_explanation(ui):
+    at, api = ui
+    api.result["findings"][1]["explanation"] = "Executor preparation timed out. Observed: " + QUOTE
+    submit(at)
+    short_prose = [literal(item.value) for item in answer_elements(at)
+                   if item.type == "markdown"]
+    assert "Executor preparation timed out." in short_prose
+    assert not any("Observed: " in item for item in short_prose)
+    assert QUOTE not in answer_text(at)
+    assert QUOTE in [item.value for item in at.code]
 
 
 def test_specific_causal_job_prioritized_over_pipeline_status_and_visibility(ui):
@@ -493,16 +750,18 @@ def test_specific_causal_job_prioritized_over_pipeline_status_and_visibility(ui)
     api.result["status"] = "failed"
     api.result["findings"][2]["severity"] = "error"
     submit(at)
-    assert at.subheader[0].value == "Error · " + TITLE
-    assert any("GitLab reported pipeline failed" in item.value for item in at.error)
+    assert at.subheader[0].value == TITLE
+    assert "Pipeline failed" in answer_text(at)
+    assert not any(item.key.startswith("issue-") for item in at.selectbox)
+    assert not any("Pipeline failed" in literal(item.label) for item in at.expander)
 
 
-def test_pipeline_success_and_allow_failure_are_prominent_warnings_not_failure(ui):
+def test_pipeline_success_and_allow_failure_are_compact_not_failure(ui):
     at, _ = ui
     submit(at)
-    warning = next(item.value for item in at.warning if "pipeline success" in item.value)
-    assert "inspection warning" in warning
-    assert "allow_failure=true" in warning
+    caption = next(literal(item.value) for item in at.caption if "Pipeline passed" in item.value)
+    assert "allowed failure" in caption
+    assert "allow_failure=true" in caption
     assert not at.error
 
 
@@ -512,9 +771,8 @@ def test_selected_successful_job_keeps_parent_pipeline_context(ui):
     api.result["reference_kind"] = "job"
     api.result["resolved_url"] = f"{PROJECT}/-/jobs/8"
     submit(at, f"{PROJECT}/-/jobs/8")
-    assert any("reported success" in item.value and "not declared failed" in item.value
-               for item in at.info)
-    assert at.subheader[0].value == "Warning · " + TITLE
+    assert "Selected job deploy: success; parent findings are separate" in answer_text(at)
+    assert at.subheader[0].value == TITLE
     assert "Resolved parent pipeline" in rendered_text(at)
     assert PIPELINE in rendered_text(at)
 
@@ -527,8 +785,7 @@ def test_passed_sample_uses_passed_message_without_inventing_failure(ui):
     api.result["downstream"] = []
     submit(at)
     assert "No failure observed" in at.subheader[0].value
-    assert any("pipeline success" in item.value and "sampled evidence" in item.value
-               for item in at.success)
+    assert "Pipeline passed · no failure observed in sampled evidence" in answer_text(at)
     assert not at.error
 
 
@@ -540,7 +797,7 @@ def test_configuration_only_response_is_explicitly_not_runtime(ui):
     api.result["resolved_url"] = PROJECT
     submit(at, PROJECT)
     assert at.subheader[0].value == "No causal finding established"
-    assert any("Configuration-only inspection" in item.value for item in at.info)
+    assert "Configuration only" in answer_text(at)
     assert "Static checks are not runtime evidence" in rendered_text(at)
     assert "Resolved parent pipeline" not in rendered_text(at)
 
@@ -697,9 +954,442 @@ def test_only_human_confirmed_history_is_shown_as_history(ui):
     assert not api.posted("/knowledge/confirm")
 
 
+def test_retention_disclosure_is_visible_outside_collapsed_options(ui):
+    at, _ = ui
+    notices = [item for item in at.main.children.values()
+               if item.type == "caption" and item.value == dashboard.LOCAL_NOTES_NOTICE]
+    assert len(notices) == 1
+    retention = at.checkbox(key="remember_analysis")
+    assert retention.value is True
+    assert "No telemetry or uploads" in retention.proto.help
+    assert "existing notes are not deleted" in retention.proto.help
+    assert not at.get("file_uploader")
+
+
+def test_retention_opt_out_is_sent_preserved_and_separate_from_token_consent(ui):
+    at, api = ui
+    at.checkbox(key="remember_analysis").uncheck()
+    at.checkbox(key="remember_token").check()
+    submit(at, token=TOKEN)
+    assert api.posted()[0]["remember_analysis"] is False
+    assert api.posted()[0]["remember_token"] is True
+    assert at.checkbox(key="remember_analysis").value is False
+    assert "No diagnostic notes saved for this analysis" in answer_text(at)
+    assert "Redacted observation saved locally" not in rendered_text(at)
+    assert "existing notes stay on this device" in rendered_text(at)
+    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    submit(at)
+    assert api.posted()[1]["remember_analysis"] is False
+    at.checkbox(key="remember_analysis").check()
+    submit(at)
+    assert api.posted()[2]["remember_analysis"] is True
+    assert len(api.posted()) == 3
+    assert not api.posted("/knowledge/confirm")
+    assert not any(path.endswith("/export") for _, path, _ in api.calls)
+
+
+@pytest.mark.parametrize("reported", [True, None], ids=["ignored-opt-out", "unconfirmed-retention"])
+def test_retention_opt_out_cannot_be_silently_ignored_by_an_older_api(ui, monkeypatch, reported):
+    at, api = ui
+    post = api.post
+
+    def response(path, payload=None):
+        result = post(path, payload)
+        if path == f"{LOCAL}/inspect":
+            if reported is None:
+                result.pop("knowledge_saved", None)
+            else:
+                result["knowledge_saved"] = reported
+        return result
+
+    monkeypatch.setattr(api, "post", response)
+    at.checkbox(key="remember_analysis").uncheck()
+    submit(at)
+    text = answer_text(at)
+    expected = (
+        "saved despite opting out" if reported else "did not confirm whether notes were retained"
+    )
+    assert expected in text
+    assert "No diagnostic notes saved" not in text
+
+
+@pytest.mark.parametrize(("rule", "scores"), [
+    ("connection_reset", ["94/100", "15/100"]),
+    ("artifact_failure", ["30/100", "10/100"]),
+])
+def test_deployment_summary_evidence_is_on_main_before_collapsed_details(ui, rule, scores):
+    at, api = ui
+    remediation = use_deployment_summary(api, rule=rule)
+    evidence = api.result["findings"][1]["evidence"][1]
+    submit(at, token=TOKEN)
+    main = answer_elements(at)
+    codes = [item for item in main if item.type == "code"]
+    assert len(codes) == 1
+    assert codes[0].proto.language == "text"
+    assert "field mappings: deployed=12, failed=1, skipped=897" in codes[0].value.splitlines()
+    assert "object mappings: updated=3" in codes[0].value.splitlines()
+    assert any(item.type == "caption" and "Deployment summary" in item.value for item in main)
+    assert f"[Deployment summary source](<{SUMMARY_URL}>)" in answer_text(at)
+    assert "No verified source patch" in answer_text(at)
+    assert ".gitlab-ci.yml" not in answer_text(at)
+    assert not any(item.proto.language == "diff" for item in at.code)
+    assert [item.value for item in at.metric] == scores
+    assert not at.tabs and len(at.subheader) == 1
+    assert outer_expanders(at) == ["Evidence & details"]
+    assert all(not item.proto.expanded for item in at.expander)
+    details = next(item for item in at.expander if item.label == "Evidence & details")
+    assert remediation["source_blocks"][0]["content"] in [item.value for item in details.code]
+    more = next(item for item in details.expander
+                if item.label == "More evidence, safe steps & references")
+    assert evidence["text"] in [item.value for item in more.code]
+    logs = next(item for item in details.expander
+                if item.label == "Raw redacted logs (bounded view)")
+    assert "Process exited with code 1." in logs.code[0].value
+    assert at.text_input(key="inspection_url").value == PIPELINE
+    assert at.text_input(key="read_only_token").value == ""
+    assert dashboard.LOCAL_NOTES_NOTICE in rendered_text(at)
+    assert len(api.posted()) == 1
+
+
+def test_deployment_summary_source_keeps_canonical_artifact_path_not_query_or_redirect(ui):
+    at, api = ui
+    use_deployment_summary(api)
+    evidence = api.result["findings"][1]["evidence"][1]
+    evidence["source_url"] = (
+        SUMMARY_URL.replace(HOST, "https://GITLAB.TEST:443")
+        + f"?private_token={TOKEN}&redirect=https://external.invalid/#untrusted"
+    )
+    submit(at)
+    assert f"[Deployment summary source](<{SUMMARY_URL}>)" in answer_text(at)
+    assert "external.invalid" not in answer_text(at)
+    assert "untrusted" not in answer_text(at)
+    assert TOKEN not in rendered_text(at)
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)", "data:text/html,<script>alert(1)</script>",
+    "file:///C:/local/summary.json", "//external.invalid/summary.json",
+    f"https://user:{TOKEN}@gitlab.test/group/sample/-/jobs/7/artifacts/file/{SUMMARY_PATH}",
+    SUMMARY_URL + "/%0aunsafe",
+])
+def test_deployment_summary_unsafe_source_is_not_linkable(ui, url):
+    at, api = ui
+    use_deployment_summary(api)
+    api.result["findings"][1]["evidence"][1]["source_url"] = url
+    submit(at)
+    assert "failed=1, skipped=897" in answer_text(at)
+    assert "Deployment summary source" not in answer_text(at)
+    assert url not in answer_text(at)
+    assert not any(item.type == "markdown" and item.proto.allow_html
+                   for item in answer_elements(at))
+
+
+def test_deployment_summary_is_redacted_literal_text_not_html_or_a_source_diff(ui):
+    at, api = ui
+    use_deployment_summary(api)
+    hostile = '<img src="https://external.invalid/pixel"> ![x](https://external.invalid/pixel)'
+    api.result["findings"][1]["evidence"][1]["text"] = (
+        f"field mappings: failed=1, skipped=897\ntoken={TOKEN}\n{hostile}"
+    )
+    submit(at)
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert len(codes) == 1 and codes[0].proto.language == "text"
+    assert "[REDACTED]" in codes[0].value and TOKEN not in answer_text(at)
+    assert hostile in codes[0].value
+    assert not any(item.proto.language == "diff" for item in at.code)
+    assert not any(hostile in item.value for item in at.markdown if item.proto.allow_html)
+    assert not at.get("imgs") and not at.get("iframe")
+
+
+@pytest.mark.parametrize("bound", ["characters", "lines"])
+def test_deployment_summary_excerpt_is_bounded_after_redaction(ui, bound):
+    at, api = ui
+    use_deployment_summary(api)
+    text = "field mappings: failed=1, skipped=897\n"
+    if bound == "characters":
+        text += "x" * (dashboard.MAX_SUMMARY_CHARS - len(text) - len("\ntoken=") - 8)
+        text += f"\ntoken={TOKEN}\nOmitted end of evidence."
+    else:
+        text += "safe summary line\n" * dashboard.MAX_SUMMARY_LINES
+        text += "Omitted end of evidence."
+    api.result["findings"][1]["evidence"][1]["text"] = text
+    submit(at)
+    code = next(item for item in answer_elements(at) if item.type == "code")
+    assert len(code.value) <= dashboard.MAX_SUMMARY_CHARS
+    assert len(code.value.splitlines()) <= dashboard.MAX_SUMMARY_LINES
+    assert TOKEN[:8] not in code.value
+    assert "Omitted end of evidence" not in answer_text(at)
+    assert "Summary excerpt" in answer_text(at)
+    assert SUMMARY_URL in answer_text(at)
+    assert "Omitted end of evidence" in rendered_text(at)
+
+
+@pytest.mark.parametrize("mismatch", ["rule", "path", "empty", "missing"])
+def test_deployment_summary_requires_recognized_rule_path_and_text(ui, mismatch):
+    at, api = ui
+    remediation = use_deployment_summary(api)
+    finding = api.result["findings"][1]
+    evidence = finding["evidence"][1]
+    if mismatch == "rule":
+        finding["rule_id"] += ".unrecognized"
+        remediation["rule_id"] = finding["rule_id"]
+    elif mismatch == "path":
+        evidence["path"] = "datasync/other-summary.json"
+    elif mismatch == "empty":
+        evidence["text"] = " \n "
+    else:
+        finding["evidence"] = finding["evidence"][:1]
+    submit(at)
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert [item.value for item in codes] == [remediation["source_blocks"][0]["content"]]
+    assert "Deployment summary source" not in answer_text(at)
+    assert SUMMARY_URL not in answer_text(at)
+
+
+def test_deployment_summary_does_not_replace_an_existing_diff_or_low_confidence_source(ui):
+    at, api = ui
+    use_deployment_summary(api)
+    artifact = deepcopy(api.result["findings"][1]["evidence"][1])
+    rule = api.result["findings"][1]["rule_id"]
+    remediation = use_source_proposal(api, fix_confidence=20)
+    remediation["rule_id"] = api.result["findings"][1]["rule_id"] = rule
+    api.result["findings"][1]["evidence"].append(artifact)
+    submit(at)
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert [item.value for item in codes] == [SOURCE_DIFF, SOURCE_TEXT]
+    assert [item.proto.language for item in codes] == ["diff", "json"]
+    assert "Deployment summary source" not in answer_text(at)
+    assert "No verified source patch" not in answer_text(at)
+    assert at.metric[1].value == "20/100"
+
+
+def test_exact_source_diff_confidence_condition_and_verification_are_in_main_answer(ui):
+    at, api = ui
+    remediation = use_source_proposal(api)
+    submit(at)
+    assert at.subheader[0].value == "CSV filename was passed as a Salesforce object"
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert len(codes) == 1
+    assert codes[0].value == SOURCE_DIFF
+    assert codes[0].proto.language == "diff"
+    assert [item.value for item in at.metric] == ["91/100", "82/100"]
+    text = answer_text(at)
+    assert f"{SOURCE_PATH} · line 2" in text
+    assert SOURCE_URL + "#L2" in text
+    assert CONDITION in text
+    assert "\n".join(f"{index}. {step}" for index, step in enumerate(VERIFY, 1)) in text
+    assert "CI definition" not in text and ".gitlab-ci.yml" not in text
+    assert "No verified source patch" not in text
+    assert "Review only · not applied or target-verified" in text
+    assert remediation["proposals"][0]["rationale"] not in text
+    assert not any(item.type == "button" for item in answer_elements(at))
+    assert not any(re.search(r"apply|commit|retry|deploy|create.*(?:mr|merge)", item.label, re.I)
+                   for item in at.button)
+    assert not at.tabs and outer_expanders(at) == ["Evidence & details"]
+    assert len(api.posted()) == 1
+
+
+def test_multiple_source_proposals_are_bounded_and_not_truncated(ui):
+    at, api = ui
+    remediation = use_source_proposal(api)
+    remediation["proposals"] *= 5
+    submit(at)
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert len(codes) == dashboard.MAX_PROPOSALS
+    assert all(item.value == SOURCE_DIFF and item.proto.language == "diff" for item in codes)
+    assert "Showing 3 of 5 source proposals" in answer_text(at)
+
+
+@pytest.mark.parametrize("ending", ["lf", "crlf", "no-final-newline"])
+def test_exact_diff_and_source_preserve_line_endings_and_boundary_whitespace(ui, ending):
+    at, api = ui
+    remediation = use_source_proposal(api, fix_confidence=20)
+    proposal = remediation["proposals"][0]
+    block = remediation["source_blocks"][0]
+    if ending == "crlf":
+        proposal["diff"] = proposal["diff"].replace("\n", "\r\n")
+        block["content"] = block["content"].replace("\n", "\r\n")
+    elif ending == "no-final-newline":
+        proposal["diff"] = proposal["diff"].removesuffix("\n")
+        block["content"] = block["content"].removesuffix("\n")
+    block["content"] = "\n  " + block["content"] + "  \n"
+    submit(at)
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert [item.value for item in codes] == [proposal["diff"], block["content"]]
+
+
+@pytest.mark.parametrize("kind", ["absent", "malformed", "non-source", "oversized"])
+def test_no_fabricated_or_partial_diff_when_a_source_patch_cannot_be_displayed(ui, kind):
+    at, api = ui
+    remediation = use_source_proposal(api)
+    if kind == "absent":
+        remediation["proposals"] = []
+    elif kind == "malformed":
+        remediation["proposals"][0]["diff"] = "Just replace the field."
+    elif kind == "non-source":
+        remediation["proposals"][0]["kind"] = "action"
+    else:
+        remediation["proposals"][0]["diff"] += " " + "x" * dashboard.MAX_DIFF_CHARS
+    submit(at)
+    assert "No verified source patch" in answer_text(at)
+    assert not any(item.proto.language == "diff" for item in at.code)
+    assert SOURCE_TEXT in [item.value for item in at.code]
+    if kind == "oversized":
+        assert "No truncated or reconstructed diff" in answer_text(at)
+
+
+def test_source_block_exact_prefix_is_bounded_to_8k_without_new_content(ui):
+    at, api = ui
+    remediation = use_source_proposal(api)
+    remediation["proposals"] = []
+    source = remediation["source_blocks"][0]
+    source["content"] = ("safe source line " + "a" * 150 + "\r\n") * 160
+    source["line_start"], source["line_end"] = 20, 179
+    source["language"] = '<img src="https://external.invalid/">'
+    submit(at)
+    code = next(item for item in answer_elements(at) if item.type == "code")
+    expected = "".join(source["content"].splitlines(keepends=True)[:80])[:8000]
+    assert code.value == expected
+    assert len(code.value) <= dashboard.MAX_SOURCE_CHARS
+    assert code.proto.language == "text"
+    assert "Exact source prefix shown" in answer_text(at)
+    assert SOURCE_URL + "#L20-179" in answer_text(at)
+
+
+def test_low_fix_confidence_keeps_trusted_docs_anchor_and_exact_source_on_main(ui):
+    at, api = ui
+    remediation = use_source_proposal(api, fix_confidence=35)
+    remediation["documentation"] = [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/compiler-messages/cs0161?token=discard#example",
+        "https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/ci-integration/gitlab-integration/#configuring-your-gitlab-ci-yml-file",
+        "https://docs.gitlab.com.evil.test/collect#secret",
+        "https://external.invalid/collect",
+        "http://docs.gitlab.com/runner/faq/#unsafe",
+    ]
+    api.result["findings"][1]["documentation"] = []
+    submit(at)
+    text = answer_text(at)
+    assert "cs0161#example" in text
+    assert "#configuring-your-gitlab-ci-yml-file" in text
+    assert "discard" not in text and "external.invalid" not in text and "evil.test" not in text
+    assert "#unsafe" not in text
+    codes = [item for item in answer_elements(at) if item.type == "code"]
+    assert [item.value for item in codes] == [SOURCE_DIFF, SOURCE_TEXT]
+    assert at.metric[1].value == "35/100"
+    assert all(path.startswith(LOCAL + "/") for _, path, _ in api.calls)
+
+
+@pytest.mark.parametrize(
+    "remediations", [None, [], "invalid", [{"rule_id": "wrong", "job_id": "7"}]],
+    ids=["missing", "empty", "invalid", "wrong-rule"],
+)
+def test_backward_api_without_matching_remediation_has_unknown_scores(ui, remediations):
+    at, api = ui
+    if remediations is None:
+        api.result.pop("remediations")
+    else:
+        api.result["remediations"] = remediations
+    submit(at)
+    assert [item.value for item in at.metric] == ["Unknown", "Unknown"]
+    assert "No verified source patch" in answer_text(at)
+    assert "94" not in answer_text(at) and "96%" not in rendered_text(at)
+    assert FIXES[0] in answer_text(at)
+
+
+@pytest.mark.parametrize("score", [None, -1, 101, True, "94", float("nan"), float("inf")],
+                         ids=["missing", "negative", "too-large", "bool", "string", "nan", "inf"])
+def test_invalid_scores_never_become_numeric_confidence(ui, score):
+    at, api = ui
+    api.result["remediations"][0].update(cause_confidence=score, fix_confidence=score)
+    submit(at)
+    assert [item.value for item in at.metric] == ["Unknown", "Unknown"]
+
+
+@pytest.mark.parametrize("score", [0, 100, 62.5])
+def test_valid_scores_include_zero_and_are_not_percent_probabilities(ui, score):
+    at, api = ui
+    api.result["remediations"][0].update(cause_confidence=score, fix_confidence=score)
+    submit(at)
+    assert [item.value for item in at.metric] == [f"{score:g}/100", f"{score:g}/100"]
+    assert not any("%" in item.value for item in at.metric)
+
+
+def test_unrecognized_score_semantics_are_not_labeled_as_supported_heuristics(ui):
+    at, api = ui
+    api.result["remediations"][0]["score_label"] = "Guaranteed probability of a fix"
+    submit(at)
+    assert [item.value for item in at.metric] == ["Unknown", "Unknown"]
+    assert "Guaranteed probability" not in rendered_text(at)
+
+
+def test_multiple_genuine_issues_switch_exact_job_remediation_without_new_inspection(ui):
+    at, api = ui
+    second = deepcopy(api.result["findings"][1])
+    second.update(job_id="9", title="Runner cannot reach a second executor")
+    api.result["findings"].append(second)
+    other = remediation_fixture(job_id="9")
+    other.update(cause_confidence=45, fix_confidence=12)
+    api.result["remediations"].insert(0, other)
+    api.result["findings"].insert(0, {
+        "rule_id": "pipeline.failed", "category": "pipeline_status", "severity": "error",
+        "title": "Pipeline failed", "fix": [], "evidence": [],
+    })
+    submit(at)
+    assert at.subheader[0].value == TITLE
+    assert at.metric[0].value == "91/100"
+    selector = next(item for item in at.selectbox if item.key.startswith("issue-"))
+    assert len(selector.options) == 2
+    assert all("CI visibility" not in option and "Pipeline failed" not in option
+               for option in selector.options)
+    # AppTest.select_index supplies the display label, not the underlying int.
+    selector.set_value(1).run()
+    assert not at.exception
+    assert at.subheader[0].value == second["title"]
+    assert [item.value for item in at.metric] == ["45/100", "12/100"]
+    assert len(api.posted()) == 1
+
+
+def test_specific_finding_fix_wins_over_generic_remediation_and_number_prefixes_do_not_nest(ui):
+    at, api = ui
+    api.result["findings"][1]["fix"] = ["1. " + FIXES[0], "2) " + FIXES[1]]
+    api.result["remediations"][0]["actions"] = ["Read the logs."]
+    submit(at)
+    text = answer_text(at)
+    assert "1. " + FIXES[0] + "\n2. " + FIXES[1] in text
+    assert "1. 1." not in text and "Read the logs" not in text
+
+
+def test_specific_remediation_actions_replace_a_generic_finding_fix(ui):
+    at, api = ui
+    api.result["findings"][1]["fix"] = ["Review the logs."]
+    api.result["remediations"][0]["actions"] = [
+        "Confirm TCP 22 reaches executor.invalid from the runner host.",
+    ]
+    submit(at)
+    assert "Confirm TCP 22" in answer_text(at)
+    assert "Review the logs" not in answer_text(at)
+
+
+def test_source_file_link_never_points_to_a_different_ci_file(ui):
+    at, api = ui
+    remediation = use_source_proposal(api)
+    remediation["proposals"][0]["source_url"] = f"{PROJECT}/-/blob/{SHA}/.gitlab-ci.yml#L1"
+    submit(at)
+    assert SOURCE_PATH in answer_text(at)
+    assert ".gitlab-ci.yml" not in answer_text(at)
+    assert SOURCE_DIFF in [item.value for item in at.code]
+
+
 @pytest.mark.parametrize(("value", "expected"), [
     (PIPELINE + "?token=do-not-display#secret", PIPELINE),
     (PIPELINE + "#L2", PIPELINE + "#L2"),
+    (PIPELINE + "#L2-4", PIPELINE + "#L2-4"),
+    (PIPELINE + "#L2-L4", PIPELINE + "#L2-L4"),
+    (DOC_URL + "?untrusted", "https://docs.gitlab.com/runner/faq/"),
+    (DOC_URL, DOC_URL),
+    ("https://docs.gitlab.com/runner/faq/?token=discard#check-the-runner", DOC_URL),
+    ("https://other.test/docs#check-the-runner", "https://other.test/docs"),
+    ("https://docs.gitlab.com.evil.test/faq/#check-the-runner", "https://docs.gitlab.com.evil.test/faq/"),
     ("javascript:alert(1)", None),
     (f"https://user:{TOKEN}@gitlab.test/group/sample", None),
     (f"{PROJECT}/-/blob/main/%0aevil", None),
@@ -711,6 +1401,23 @@ def test_only_human_confirmed_history_is_shown_as_history(ui):
 ])
 def test_display_links_drop_query_secrets_and_reject_unsafe_urls(value, expected):
     assert dashboard._safe_url(value) == expected
+
+
+@pytest.mark.parametrize("host", [
+    "docs.gitlab.com", "learn.microsoft.com", "developer.salesforce.com", "docs.sonarsource.com",
+])
+def test_public_documentation_allowlist_keeps_simple_anchors_and_no_queries(host):
+    value = f"https://{host}/reference?token=discard#exact-section"
+    assert dashboard._documentation_url(value) == f"https://{host}/reference#exact-section"
+
+
+@pytest.mark.parametrize("url", [
+    "https://external.invalid/docs#section", "https://docs.gitlab.com.evil.test/docs#section",
+    "http://docs.gitlab.com/docs#section", "https://docs.gitlab.com:444/docs#section",
+    "https://user:secret@docs.gitlab.com/docs#section", "javascript:alert(1)",
+])
+def test_docs_links_reject_arbitrary_hosts_ports_credentials_and_non_https(url):
+    assert dashboard._documentation_url(url) is None
 
 
 def test_table_source_url_uses_explicit_clean_target_not_escaped_autolink():
@@ -735,10 +1442,62 @@ def test_untrusted_markdown_cannot_become_active_html_images_or_inline_assets(ui
     assert "https://" not in html[0] and "@import" not in html[0]
 
 
+def test_remediation_content_is_literal_and_cannot_add_active_assets_or_actions(ui):
+    at, api = ui
+    remediation = use_source_proposal(api, fix_confidence=20)
+    hostile = '<img src="https://external.invalid/pixel"> ![x](https://external.invalid/pixel)'
+    proposal = remediation["proposals"][0]
+    proposal.update(title=hostile, condition=hostile, rationale=hostile, verification=[hostile])
+    proposal["diff"] = SOURCE_DIFF.replace("Sample", hostile)
+    remediation["source_blocks"][0]["content"] = hostile
+    remediation["confidence_basis"] = [hostile]
+    remediation["missing_information"] = [hostile]
+    remediation["documentation"] = [{"title": hostile, "url": DOC_URL + "?invalid-fragment"}]
+    submit(at)
+    assert proposal["diff"] in [item.value for item in at.code]
+    assert hostile in [item.value for item in at.code]
+    assert "**" + dashboard._md(hostile) + "**" in [item.value for item in at.markdown]
+    html = [item.value for item in at.markdown if item.proto.allow_html]
+    assert len(html) == 1 and "<style>" in html[0] and hostile not in html[0]
+    assert not at.get("imgs") and not at.get("iframe")
+    assert not any(item.type == "button" for item in answer_elements(at))
+    assert all(path.startswith(LOCAL + "/") for _, path, _ in api.calls)
+
+
+def test_each_static_source_finding_can_select_its_own_remediation():
+    from pipelinelens.services.findings import finding_identity
+
+    first = {"rule_id": "change.ci_path_case_mismatch", "job_id": None,
+             "category": "repository_path_risk", "severity": "warning",
+             "evidence": [{"path": "ci/first.yml", "line": 2, "text": "bad-case"}]}
+    second = deepcopy(first)
+    second["evidence"][0]["path"] = "ci/second.yml"
+    plans = [{"rule_id": first["rule_id"], "job_id": None,
+              "finding_key": finding_identity(item)} for item in (first, second)]
+    assert len(dashboard._genuine_findings([first, second])) == 2
+    assert dashboard._remediation_for({"remediations": plans}, second) == plans[1]
+
+
+def test_every_curated_runbook_link_is_allowed_by_the_documentation_ui():
+    from pipelinelens.services.runbooks import _RUNBOOKS
+
+    for book in _RUNBOOKS:
+        for url in book.urls:
+            assert dashboard._documentation_url(url) == url
+
+
+def test_child_finding_is_not_attributed_to_root_history_or_confirmation():
+    parent = {"jobs": [{"external_id": "11"}]}
+    assert dashboard._root_finding(parent, {"job_id": "11"})
+    assert dashboard._root_finding(parent, {"job_id": None})
+    assert not dashboard._root_finding(parent, {"job_id": "99"})
+
+
 def test_no_legacy_network_path_or_cached_token_client_remains():
     source = APP.read_text(encoding="utf-8")
     assert "/system/status" not in source
     assert "/pipeline-url/analyze" not in source
+    assert "st.tabs(" not in source
     assert "cache_resource" not in source and "cache_data" not in source
     tree = ast.parse(source)
     assert all(not node.decorator_list for node in tree.body if isinstance(node, ast.FunctionDef))

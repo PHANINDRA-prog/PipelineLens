@@ -30,15 +30,18 @@ with patch("dotenv.load_dotenv", return_value=False):
     from pipelinelens.domain import (
         CiConfigAccessEntry,
         CiConfigAccessReport,
+        CiConfigFile,
         PipelineJob,
         PipelineRun,
         ProviderName,
         RepositoryRef,
     )
     from pipelinelens.providers.base import ProviderError
+    from pipelinelens.providers.gitlab import GitLabProvider
+    from pipelinelens.services.cloud_assist import CloudAssistResult
     from pipelinelens.services.credentials import CredentialVault, CredentialVaultError
     from pipelinelens.services.findings import Finding, FindingEvidence
-    from pipelinelens.services.inspection import InspectionResult
+    from pipelinelens.services.inspection import InspectionResult, inspect_gitlab
     from pipelinelens.services.local_knowledge import KnowledgeCacheError, LocalKnowledgeCache
     from pipelinelens.services.pipeline_url import GitLabReference, PipelineUrlError
 
@@ -329,6 +332,62 @@ def local_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[_Loca
         yield _LocalApi(client, settings, vault, protector, knowledge, gitlab, clock)
 
 
+@pytest.fixture
+def provider_api(local_api, monkeypatch):
+    """Use the real inspector/provider through strict GET-only HTTP fixtures."""
+    responses = {}
+    calls = []
+    for project_id, path in ((42, _PROJECT), (99, "shared/ci")):
+        owner, _, name = path.rpartition("/")
+        project = {
+            "id": project_id, "path": name, "path_with_namespace": path,
+            "namespace": {"full_path": owner}, "default_branch": "main",
+            "web_url": f"{_HOST}/{path}",
+        }
+        responses[f"/projects/{project_id}"] = responses[f"/projects/{path}"] = project
+        responses[f"/projects/{project_id}/repository/files/.gitlab-ci.yml/raw"] = (
+            "build:\n  script: echo built\n"
+        )
+        responses[f"/projects/{project_id}/repository/tree"] = [
+            {"path": ".gitlab-ci.yml", "type": "blob"},
+        ]
+        run_id, job_id = (_RUN_ID, _JOB_ID) if project_id == 42 else ("17", "601")
+        status = "success" if project_id == 42 else "failed"
+        responses[f"/projects/{project_id}/pipelines/{run_id}"] = {
+            "id": int(run_id), "project_id": project_id, "status": status,
+            "ref": "main", "sha": _SHA,
+        }
+        responses[f"/projects/{project_id}/pipelines/{run_id}/jobs"] = [{
+            "id": int(job_id), "name": "build", "status": status,
+            "pipeline": {"id": int(run_id), "project_id": project_id},
+        }]
+        for resource in ("bridges", "merge_requests"):
+            responses[f"/projects/{project_id}/pipelines/{run_id}/{resource}"] = []
+        responses[f"/projects/{project_id}/repository/commits/{_SHA}/diff"] = []
+        responses[f"/projects/{project_id}/jobs/{job_id}/trace"] = (
+            "Job succeeded" if project_id == 42 else "ERROR: child-private-diagnostic"
+        )
+
+    def handle(request):
+        assert request.method == "GET" and request.url.host == "gitlab.example.test"
+        if request.headers.get("PRIVATE-TOKEN") != _REQUEST:
+            pytest.fail("Unexpected credential in the HTTP fixture.", pytrace=False)
+        path = request.url.path.removeprefix("/api/v4")
+        calls.append(path)
+        assert path in responses, f"Unexpected mocked GET: {path}"
+        payload = responses[path]
+        if type(payload) is int:
+            return httpx.Response(payload)
+        return (httpx.Response(200, text=payload) if isinstance(payload, str)
+                else httpx.Response(200, json=payload))
+
+    monkeypatch.setattr(inspection_api, "GitLabProvider", lambda base_url: GitLabProvider(
+        base_url, transport=httpx.MockTransport(handle),
+    ))
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", inspect_gitlab)
+    return local_api, responses, calls
+
+
 def test_all_local_endpoints_require_the_exact_local_header(local_api, tmp_path) -> None:
     endpoints = [
         ("GET", "/status", None),
@@ -529,6 +588,27 @@ def test_failed_saved_resource_access_cannot_associate_or_return_cached_evidence
     _assert_no_secrets(denied.text + revoked.text)
 
 
+def test_disabling_diagnostic_notes_does_not_create_a_knowledge_file(local_api) -> None:
+    response = local_api.inspect(remember_analysis=False)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["knowledge_saved"] is False
+    assert not local_api.knowledge.path.exists()
+    assert "remediations" in payload and "corpus_matches" in payload
+    assert "on this device" in payload["retention_notice"]
+    _assert_no_secrets(response.text)
+
+
+def test_note_opt_out_preserves_existing_notes_without_adding_new_ones(local_api) -> None:
+    assert local_api.inspect().json()["knowledge_saved"] is True
+    original = local_api.knowledge.path.read_bytes()
+    local_api.gitlab.run.commit_sha = "b" * 40
+    response = local_api.inspect(remember_analysis=False, refresh=True)
+    assert response.status_code == 200
+    assert response.json()["knowledge_saved"] is False
+    assert local_api.knowledge.path.read_bytes() == original
+
+
 def test_forgetting_connection_clears_the_vault_entry_and_response_cache(local_api) -> None:
     remembered = local_api.inspect(remember_token=True)
     assert remembered.status_code == 200 and remembered.json()["credential_saved"] is True
@@ -568,6 +648,141 @@ def test_cache_hits_reverify_resource_and_label_original_source_time_and_age(loc
     job_calls = local_api.gitlab.calls_for("list_pipeline_jobs")
     assert [call.max_jobs for call in job_calls] == [300, 300]
     assert len(local_api.gitlab.calls_for("inspect_gitlab")) == 1
+
+
+@pytest.mark.parametrize("local_include", [False, True])
+def test_single_project_cache_keeps_fast_path_with_actual_provider(provider_api, local_include):
+    api, responses, calls = provider_api
+    include_path = "/projects/42/repository/files/ci/build.yml/raw"
+    if local_include:
+        responses["/projects/42/repository/files/.gitlab-ci.yml/raw"] = "include: ci/build.yml\n"
+        responses[include_path] = "build:\n  script: echo built\n"
+    assert api.inspect().json()["cached"] is False
+    api.clock.seconds = 7
+    cached = api.inspect().json()
+    assert cached["cached"] is True and cached["cache_age_seconds"] == 7
+    assert calls.count("/projects/42/repository/files/.gitlab-ci.yml/raw") == 1
+    assert calls.count(include_path) == int(local_include)
+    assert calls.count(f"/projects/42/jobs/{_JOB_ID}/trace") == 1
+    assert calls.count(f"/projects/42/pipelines/{_RUN_ID}/jobs") == 3
+    assert any("not reread" in note for note in cached["notes"])
+
+
+@pytest.mark.parametrize("source_kind", ["project_include", "configured_root"])
+@pytest.mark.parametrize("denied_resource", ["project", "file"])
+@pytest.mark.parametrize("status", [403, 404])
+def test_revoked_shared_source_access_never_reuses_cached_evidence(
+    provider_api, source_kind, denied_resource, status,
+) -> None:
+    api, responses, calls = provider_api
+    project_path = "/projects/shared/ci"
+    file_path = "/projects/99/repository/files/shared.yml/raw"
+    responses[file_path] = "shared_protected_job:\n  script: echo shared-source-evidence\n"
+    if source_kind == "project_include":
+        responses["/projects/42/repository/files/.gitlab-ci.yml/raw"] = (
+            f"include:\n  project: shared/ci\n  file: shared.yml\n  ref: {_SHA}\n"
+        )
+    else:
+        responses[f"/projects/{_PROJECT}"]["ci_config_path"] = f"shared.yml@shared/ci:{_SHA}"
+    first = api.inspect()
+    assert first.status_code == 200 and "shared-source-evidence" in first.text
+    if source_kind == "project_include":
+        assert first.json()["ci_config_access"]["complete"] is True
+    api.clock.seconds = 7
+    responses[project_path if denied_resource == "project" else file_path] = status
+    second = api.inspect()
+
+    assert second.status_code == 200
+    payload = second.json()
+    assert payload["cached"] is False and payload["cache_age_seconds"] == 0
+    assert payload["inspected_at"] != first.json()["inspected_at"]
+    assert "shared-source-evidence" not in second.text
+    assert payload["ci_config_access"]["complete"] is False and payload["status"] == "warning"
+    assert any(entry["state"] == "unreadable" for entry in payload["ci_config_access"]["entries"])
+    assert any("not response-cached" in note for note in payload["notes"])
+    assert calls.count(project_path) == 2
+    assert calls.count(file_path) == (1 if denied_resource == "project" else 2)
+
+
+@pytest.mark.parametrize("denied_path", [
+    "/projects/99", "/projects/99/pipelines/17", "/projects/99/pipelines/17/jobs",
+    "/projects/99/jobs/601/trace",
+])
+def test_revoked_downstream_access_never_reuses_child_diagnostics(provider_api, denied_path):
+    api, responses, calls = provider_api
+    responses[f"/projects/42/pipelines/{_RUN_ID}/bridges"] = [{
+        "id": 8, "name": "trigger-child", "status": "failed",
+        "downstream_pipeline": {"id": 17, "project_id": 99, "status": "failed"},
+    }]
+    first = api.inspect()
+    assert first.status_code == 200 and "child-private-diagnostic" in first.text
+    api.clock.seconds = 7
+    responses[denied_path] = 403
+    second = api.inspect()
+    assert second.status_code == 200 and second.json()["cached"] is False
+    assert "child-private-diagnostic" not in second.text
+    assert any("HTTP 403" in note and "partial" in note for note in second.json()["notes"])
+    assert calls.count(denied_path) == 2
+
+
+@pytest.mark.parametrize("reason", [
+    "partial_sources", "unknown_source", "foreign_root", "foreign_config", "foreign_mr",
+    "downstream", "oversized",
+])
+def test_uncacheable_refresh_evicts_previous_snapshot(local_api, monkeypatch, reason) -> None:
+    assert local_api.inspect().json()["cached"] is False
+
+    async def changed_inspection(*args, **kwargs):
+        result = await local_api.gitlab.inspect(*args, **kwargs)
+        if reason == "partial_sources":
+            result.ci_config_access.complete = False
+        elif reason == "unknown_source":
+            result.ci_config_access.entries[0].source_url = None
+        elif reason == "foreign_root":
+            result.ci_config_access.entries[0].source_url = (
+                f"{_HOST}/shared/ci/-/blob/{_SHA}/ci.yml"
+            )
+        elif reason == "foreign_config":
+            result.config_bundle = [CiConfigFile(
+                path="ci.yml", ref=_SHA, content="build: {}",
+                source_url=f"{_HOST}/shared/ci/-/blob/{_SHA}/ci.yml",
+            )]
+        elif reason == "foreign_mr":
+            result.merge_requests = [{"iid": 7, "web_url": f"{_HOST}/shared/ci/-/merge_requests/7"}]
+        elif reason == "downstream":
+            result.downstream = [{"access": "unavailable"}]
+        return result
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", changed_inspection)
+    if reason == "oversized":
+        monkeypatch.setattr(inspection_api._ResultCache, "max_bytes", 1)
+    refreshed = local_api.inspect(refresh=True).json()
+    assert refreshed["cached"] is False
+    following = local_api.inspect().json()
+    assert following["cached"] is False
+    assert len(local_api.gitlab.calls_for("inspect_gitlab")) == 3
+
+
+@pytest.mark.parametrize("kind", ["pipeline", "job"])
+def test_cached_resource_rejects_changed_raw_project_identity(local_api, kind) -> None:
+    url = _PIPELINE_URL if kind == "pipeline" else f"{_PROJECT_KEY}/-/jobs/{_JOB_ID}"
+    assert local_api.inspect(url=url).status_code == 200
+    resource = local_api.gitlab.run if kind == "pipeline" else local_api.gitlab.jobs[0]
+    resource.raw["project_id"] = 999  # Raw identity is excluded from the cache fingerprint.
+    rejected = local_api.inspect(url=url, remember_token=True)
+    assert rejected.status_code == 502 and "findings" not in rejected.json()
+    assert len(local_api.gitlab.calls_for("inspect_gitlab")) == 1
+    assert local_api.vault.metadata() == []
+
+
+@pytest.mark.parametrize("parent_id", [None, 0, True, "../101"])
+def test_selected_job_requires_verifiable_parent_id_before_saving(local_api, parent_id) -> None:
+    local_api.gitlab.jobs[0].raw["pipeline"]["id"] = parent_id
+    rejected = local_api.inspect(url=f"{_PROJECT_KEY}/-/jobs/{_JOB_ID}", remember_token=True)
+    assert rejected.status_code == 502
+    assert local_api.gitlab.calls_for("get_run") == []
+    assert local_api.gitlab.calls_for("inspect_gitlab") == []
+    assert local_api.vault.metadata() == []
 
 
 def test_response_cache_is_isolated_by_token_and_max_jobs(local_api) -> None:
@@ -788,3 +1003,154 @@ def test_corrupt_vault_errors_use_safe_test_app_boundaries_without_overwriting(l
     assert local_api.gitlab.calls == []
     assert path.read_bytes() == original
     _assert_no_secrets(status.text + inspected.text + forgotten.text)
+
+
+def test_status_reports_cloud_assist_not_configured_by_default(local_api) -> None:
+    status = local_api.client.get(_PREFIX + "/status", headers=_LOCAL)
+    body = status.json()
+    assert body["cloud_assist_configured"] is False
+    assert body["cloud_assist_provider"] is None
+
+
+@dataclass
+class _FakeCloudAssistProvider:
+    """A synthetic stand-in for a future plugged-in provider (Amazon Q, Glean, ...)."""
+
+    name: str = "fake-cloud"
+    result: CloudAssistResult | None = None
+    calls: list = field(default_factory=list)
+
+    def configured(self, settings) -> bool:
+        return True
+
+    async def ask(self, settings, finding, *, client=None) -> CloudAssistResult | None:
+        self.calls.append(finding)
+        return self.result
+
+
+def test_ask_cloud_ai_defaults_off_and_stays_none(local_api) -> None:
+    response = local_api.inspect()
+    assert response.status_code == 200
+    assert response.json()["cloud_assist"] is None
+
+
+def test_ask_cloud_ai_true_but_unconfigured_makes_no_call_and_stays_none(
+    local_api, monkeypatch,
+) -> None:
+    monkeypatch.setattr(inspection_api, "resolve_cloud_assist_provider", lambda settings: None)
+
+    response = local_api.inspect(ask_cloud_ai=True)
+
+    assert response.status_code == 200
+    assert response.json()["cloud_assist"] is None
+
+
+def test_ask_cloud_ai_false_never_calls_gemini_even_when_configured(
+    local_api, monkeypatch,
+) -> None:
+    provider = _FakeCloudAssistProvider()
+    monkeypatch.setattr(inspection_api, "resolve_cloud_assist_provider", lambda settings: provider)
+
+    response = local_api.inspect()  # ask_cloud_ai omitted -> defaults to False
+
+    assert response.status_code == 200
+    assert response.json()["cloud_assist"] is None
+    assert provider.calls == []
+
+
+def test_ask_cloud_ai_true_configured_and_unknown_finding_returns_cloud_assist(
+    local_api, monkeypatch,
+) -> None:
+    async def unknown_finding_inspect(
+        provider, token, repository, reference, settings, *, max_jobs=5,
+    ):
+        del provider, token, reference, max_jobs
+        assert settings.llm_mode == "disabled"  # Settings are unrelated to this monkeypatch.
+        run = PipelineRun(
+            external_id=_RUN_ID, name="p", status="failed", commit_sha=_SHA,
+            web_url=_PIPELINE_URL,
+        )
+        return InspectionResult(
+            repository=repository, pipeline=run, selected_job=None,
+            resolved_url=_PIPELINE_URL, reference_kind="pipeline", project_key=_PROJECT_KEY,
+            jobs=[], findings=[Finding(
+                rule_id="job.insufficient_evidence", severity="error", category="build_failure",
+                title="Cause not established",
+                explanation="No specific diagnostic was found in the supplied evidence.",
+                fix=["Inspect the complete trace."],
+                evidence=[FindingEvidence(text="generic non-zero exit", line=1)],
+                confidence="unknown",
+            )],
+            ci_config_access=CiConfigAccessReport(complete=True, entries=[]),
+            status="failed",
+        )
+
+    canned = CloudAssistResult(
+        provider="fake-cloud", model="gemini-2.0-flash",
+        summary="Likely a flaky dependency install.",
+    )
+    provider = _FakeCloudAssistProvider(result=canned)
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", unknown_finding_inspect)
+    monkeypatch.setattr(inspection_api, "resolve_cloud_assist_provider", lambda settings: provider)
+
+    response = local_api.inspect(ask_cloud_ai=True)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cloud_assist"] == {
+        "provider": "fake-cloud", "model": "gemini-2.0-flash",
+        "summary": "Likely a flaky dependency install.",
+        "notice": canned.notice,
+    }
+    assert len(provider.calls) == 1
+    _assert_no_secrets(response.text)
+
+
+def test_ask_cloud_ai_true_configured_but_resolved_finding_makes_no_call(
+    local_api, monkeypatch,
+) -> None:
+    provider = _FakeCloudAssistProvider()
+    monkeypatch.setattr(inspection_api, "resolve_cloud_assist_provider", lambda settings: provider)
+
+    # The shared fixture's finding is severity="info"/category="pipeline_status",
+    # so it is not a genuine unresolved issue and must not trigger cloud assist.
+    response = local_api.inspect(ask_cloud_ai=True)
+
+    assert response.status_code == 200
+    assert response.json()["cloud_assist"] is None
+    assert provider.calls == []
+
+
+def test_gemini_failure_adds_a_note_but_never_breaks_the_local_result(
+    local_api, monkeypatch,
+) -> None:
+    async def unknown_finding_inspect(
+        provider, token, repository, reference, settings, *, max_jobs=5,
+    ):
+        del provider, token, reference, max_jobs, settings
+        return InspectionResult(
+            repository=repository, pipeline=None, selected_job=None,
+            resolved_url=_PIPELINE_URL, reference_kind="pipeline", project_key=_PROJECT_KEY,
+            jobs=[], findings=[Finding(
+                rule_id="job.insufficient_evidence", severity="error", category="build_failure",
+                title="Cause not established", explanation="No specific diagnostic was found.",
+                fix=["Inspect the complete trace."],
+                evidence=[FindingEvidence(text="generic non-zero exit", line=1)],
+                confidence="unknown",
+            )],
+            ci_config_access=CiConfigAccessReport(complete=True, entries=[]),
+            status="configuration_only",
+        )
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", unknown_finding_inspect)
+    monkeypatch.setattr(
+        inspection_api, "resolve_cloud_assist_provider",
+        lambda settings: _FakeCloudAssistProvider(result=None),
+    )
+
+    response = local_api.inspect(ask_cloud_ai=True)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cloud_assist"] is None
+    assert any("cloud assist" in note.lower() for note in body["notes"])

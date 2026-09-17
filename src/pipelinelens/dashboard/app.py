@@ -18,6 +18,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 import streamlit as st
 
 from pipelinelens.dashboard.client import ApiClientError, PipelineLensApiClient
+from pipelinelens.services.findings import finding_identity
 from pipelinelens.services.gitlab_includes import display_include_path
 from pipelinelens.services.pipeline_url import PipelineUrlError, parse_gitlab_url
 from pipelinelens.services.redaction import redact_text
@@ -29,10 +30,39 @@ PAGE_LINES = 120
 MAX_DISPLAY_CHARS = 16_000
 MAX_VIEW_CHARS = 200_000
 MAX_EXPORT_BYTES = 8 * 1024 * 1024
+MAX_SOURCE_CHARS = 8_000
+MAX_SOURCE_LINES = 80
+MAX_DIFF_CHARS = 16_000
+MAX_DIFF_LINES = 240
+MAX_PROPOSALS = 3
+MAX_SUMMARY_CHARS = 1_600
+MAX_SUMMARY_LINES = 8
+LOW_FIX_CONFIDENCE = 60
+SCORE_LABEL = "Rule-based heuristic; not a calibrated probability"
+LOCAL_NOTES_NOTICE = "Redacted diagnostic notes stay on this device"
+_DOC_HOSTS = {
+    "docs.gitlab.com": "GitLab documentation",
+    "learn.microsoft.com": "Microsoft Learn",
+    "developer.salesforce.com": "Salesforce documentation",
+    "docs.sonarsource.com": "SonarSource documentation",
+    "docs.docker.com": "Docker documentation",
+    "docs.python.org": "Python documentation",
+    "docs.npmjs.com": "npm documentation",
+    "docs.github.com": "GitHub documentation",
+    "documentation.conga.com": "Conga documentation",
+    "docs.conga.com": "Conga documentation",
+    "manpages.debian.org": "Debian documentation",
+    "jqlang.org": "jq manual",
+    "developer.mozilla.org": "MDN Web Docs",
+}
+_SOURCE_LANGUAGES = {
+    "text", "bash", "shell", "python", "csharp", "java", "javascript",
+    "typescript", "json", "yaml", "xml", "sql", "apex", "powershell",
+}
 CONNECTIONS = {
-    "auto": "Automatic · saved same-host or configured",
-    "request": "Request-only connection · enter a token",
-    "configured": "Configured connection only",
+    "auto": "Automatic",
+    "request": "New token",
+    "configured": "Configured connection",
 }
 EXPORT_NOTICE = (
     "Redaction is not a guarantee that business-sensitive data is absent. "
@@ -53,32 +83,36 @@ def _render_styles() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: #f5f8f7; color: #152d32; }
+        .stApp { background: #fff; color: #1f2937; }
         [data-testid="stHeader"] { background: transparent; }
-        .block-container { max-width: 1240px; padding: 2rem 2.5rem 4rem; }
+        .block-container { max-width: 1000px; padding: 1.5rem 2rem 3rem; }
         h1, h2, h3, p, label { font-family: "Segoe UI", system-ui, sans-serif; }
-        h1, h2, h3 { color: #123c42; letter-spacing: -0.025em; }
-        h1 { margin-bottom: 0; }
+        h1, h2, h3 { color: #111827; letter-spacing: -0.02em; }
+        h1 { margin-bottom: 0; font-size: 1.8rem !important; }
+        h3 { font-size: 1.3rem !important; }
         [data-testid="stForm"], [data-testid="stExpander"] {
-          background: #fff; border: 1px solid #cbdcda; border-radius: 12px;
+          background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
         }
-        [data-testid="stAlert"] { border-radius: 10px; }
+        [data-testid="stAlert"] { border-radius: 6px; }
+        [data-testid="stCaptionContainer"] { color: #64748b; }
         [data-testid="stMarkdownContainer"], [data-testid="stMetricValue"],
         [data-testid="stExpander"] summary, button p {
           overflow-wrap: anywhere; white-space: normal; text-overflow: clip;
         }
-        [data-testid="stTextInput"] input { min-width: 0; font-size: 1rem; }
-        [data-testid="stBaseButton-primaryFormSubmit"] {
-          background: #006d70; border-color: #006d70; color: white;
+        [data-testid="stMetricValue"] { font-size: 1.5rem; }
+        [data-testid="stTextInput"] input {
+          min-width: 0; font-size: 1rem; background: #fff; color: #111827;
         }
-        [data-testid="stCode"] pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-                [data-testid="stTable"] { max-width: 100%; overflow-x: auto; }
-                [data-testid="stTable"] table { min-width: 680px; width: 100%; table-layout: fixed; }
-                [data-testid="stTable"] td, [data-testid="stTable"] th {
-                    white-space: normal; overflow-wrap: anywhere; text-overflow: clip;
-                }
-        [data-baseweb="tab-list"] { gap: 0.75rem; overflow-x: auto; }
-        [data-baseweb="tab"] { height: auto; min-height: 3rem; white-space: normal; }
+        [data-testid="stBaseButton-primaryFormSubmit"] {
+          background: #252b35; border-color: #252b35; color: white;
+          min-height: 2.5rem;
+        }
+        [data-testid="stCode"] pre { overflow-x: auto; }
+        [data-testid="stTable"] { max-width: 100%; overflow-x: auto; }
+        [data-testid="stTable"] table { min-width: 680px; width: 100%; table-layout: fixed; }
+        [data-testid="stTable"] td, [data-testid="stTable"] th {
+          white-space: normal; overflow-wrap: anywhere; text-overflow: clip;
+        }
         [data-testid="stRadio"] [role="radiogroup"] { flex-wrap: wrap; gap: 0.5rem 1rem; }
         @media (max-width: 640px) {
           .block-container { padding: 1rem 0.8rem 2rem; }
@@ -106,6 +140,33 @@ def _md(value: object) -> str:
 
 def _objects(value: object) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _text_items(value: object) -> list[str]:
+    items = [value] if isinstance(value, str) else value if isinstance(value, list) else []
+    return [item.strip() for item in items if isinstance(item, str) and item.strip()]
+
+
+def _brief(value: object, limit: int = 480) -> str:
+    text = " ".join(value.split()) if isinstance(value, str) else ""
+    return text if len(text) <= limit else text[:limit - 1].rsplit(" ", 1)[0] + "…"
+
+
+def _numbered_steps(steps: object, *, start: int = 1, limit: int = 3) -> None:
+    # A single Markdown block keeps the browser's ordered list from restarting at 1.
+    items = _text_items(steps)[:limit]
+    if items:
+        items = [_brief(re.sub(r"^\d+[.)]\s+", "", step), 700) for step in items]
+        st.markdown("\n".join(
+            f"{index}. {_md(step)}"
+            for index, step in enumerate(items, start)
+        ))
+
+
+def _exact_code(text: str, *, language: str) -> None:
+    # st.code removes one leading and one trailing LF. Guard both boundaries so
+    # the displayed/copied payload is exactly the API's text, including CRLF.
+    st.code("\n" + text + "\n", language=language, wrap_lines=False)
 
 
 def _safe_url(value: object) -> str | None:
@@ -139,7 +200,13 @@ def _safe_url(value: object) -> str | None:
         ):
             return None
         path = quote(decoded, safe="/:@-._~!$&'()*+,;=")
-        fragment = parts.fragment if re.fullmatch(r"L[1-9]\d*(?:-[1-9]\d*)?", parts.fragment) else ""
+        fragment = parts.fragment if re.fullmatch(r"L[1-9]\d*(?:-L?[1-9]\d*)?", parts.fragment) else ""
+        if (
+            parts.scheme == "https" and host in _DOC_HOSTS and port in {None, 443}
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,199}", parts.fragment)
+            and redact_text(parts.fragment) == parts.fragment
+        ):
+            fragment = parts.fragment
         return urlunsplit((parts.scheme, authority, path, "", fragment))
     except (ValueError, UnicodeError):
         return None
@@ -148,13 +215,40 @@ def _safe_url(value: object) -> str | None:
 def _link(label: str, value: object) -> None:
     url = _safe_url(value)
     if url:
-        st.markdown(f"**{_md(label)}:** [{_md(url)}](<{url}>)")
+        st.markdown(f"[{_md(label)}](<{url}>)")
+
+
+def _documentation_url(value: object) -> str | None:
+    url = _safe_url(value)
+    if url:
+        parts = urlsplit(url)
+        if parts.scheme == "https" and parts.hostname in _DOC_HOSTS and parts.port in {None, 443}:
+            return url
+    return None
+
+
+def _url_to_keep(url: str, token: str) -> str:
+    """Retain ordinary input, but never retain credentials pasted into a URL."""
+    try:
+        parts = urlsplit(url)
+        unsafe = (
+            parts.username is not None or parts.password is not None
+            or bool(token and token in unquote(url)) or redact_text(url) != url
+            or bool(re.search(r"(?:^|[&;])(?:[\w-]*(?:token|secret|password|credential|signature)|api[_-]?key)=", unquote(parts.query), re.I))
+        )
+    except ValueError:
+        return ""
+    if not unsafe:
+        return url
+    canonical = _safe_url(url)
+    return canonical if canonical and not (token and token in unquote(canonical)) else ""
 
 
 def _initialize_state() -> None:
     defaults: dict[str, Any] = {
         "inspection_result": None, "submission_failed": False, "submission_error": None,
         "inspection_url": "", "connection_mode": "auto", "remember_token": False,
+        "remember_analysis": True, "ask_cloud_ai": False,
         "force_refresh": False, "_clear_password": False, "export_preview": None,
         "export_reviewed": False, "local_notice": None,
     }
@@ -163,6 +257,8 @@ def _initialize_state() -> None:
     # Never mutate the password widget after instantiating it in this script run.
     if st.session_state.pop("_clear_password", False):
         st.session_state["read_only_token"] = ""
+    if "_safe_inspection_url" in st.session_state:
+        st.session_state["inspection_url"] = st.session_state.pop("_safe_inspection_url")
 
 
 def _invalidate_export() -> None:
@@ -177,11 +273,6 @@ def _begin_submission() -> None:
     st.session_state.submission_error = None
     st.session_state.local_notice = None
     _invalidate_export()
-
-
-def _connection_changed() -> None:
-    if st.session_state.connection_mode == "configured":
-        st.session_state._clear_password = True
 
 
 def _local_status() -> dict[str, Any]:
@@ -210,6 +301,7 @@ def _validate_result(result: object) -> dict[str, Any]:
 
 def _inspect_submission(status: dict[str, Any], url: str, token: str) -> None:
     payload: dict[str, Any] = {}
+    entered_token = token.strip()
     try:
         if not url.strip():
             raise PipelineUrlError("Paste a GitLab pipeline, job, branch, file or repository URL.")
@@ -223,9 +315,9 @@ def _inspect_submission(status: dict[str, Any], url: str, token: str) -> None:
         canonical = _safe_url(url.strip())
         if canonical is None:
             raise PipelineUrlError("Remove secrets from the URL; enter credentials only in the password field.")
-        token = "" if mode == "configured" else token.strip()
-        if token and token in unquote(canonical):
+        if entered_token and entered_token in unquote(url):
             raise PipelineUrlError("Remove credentials from the URL; enter them only in the password field.")
+        token = "" if mode == "configured" else token.strip()
         if mode == "request" and not token:
             raise PipelineUrlError("Enter a read-only GitLab token, or choose Automatic to reuse a saved same-host connection.")
         if len(token) > 8192 or any(not 33 <= ord(char) <= 126 for char in token):
@@ -233,57 +325,88 @@ def _inspect_submission(status: dict[str, Any], url: str, token: str) -> None:
         payload = {
             "url": url.strip(), "connection": mode,
             "remember_token": bool(token and st.session_state.remember_token and status.get("vault_available")),
+            "remember_analysis": bool(st.session_state.remember_analysis),
             "refresh": bool(st.session_state.force_refresh), "max_jobs": 5,
+            "ask_cloud_ai": bool(st.session_state.ask_cloud_ai and status.get("cloud_assist_configured")),
         }
         if token:
             payload["token"] = token
-        with st.spinner("Verifying GitLab access; reading pipeline/job metadata, up to five job traces, CI include sources, MR/commit changes and bounded downstream context…"):
+        with st.spinner("Reading GitLab evidence and checking the cause…"):
             result = _validate_result(_api().post(f"{LOCAL}/inspect", payload))
         # The API owns redaction of evidence. Never persist its raw submitted-URL echo.
         result["submitted_url"] = canonical
+        result["_remember_analysis_requested"] = bool(st.session_state.remember_analysis)
         st.session_state.inspection_result = result
     except (PipelineUrlError, ApiClientError) as error:
         message = str(error)
-        if token:
-            message = message.replace(token, "[REDACTED]")
+        if entered_token:
+            message = message.replace(entered_token, "[REDACTED]")
         st.session_state.inspection_result = None
         st.session_state.submission_failed = True
         st.session_state.submission_error = redact_text(message)
     finally:
         payload.pop("token", None)
         st.session_state._clear_password = True
+        st.session_state._safe_inspection_url = _url_to_keep(url, entered_token)
     # A new run consumes the deferred clear before rendering widgets, including on failure.
     st.rerun()
 
 
 def _render_input(status: dict[str, Any]) -> None:
-    st.radio(
-        "GitLab connection", list(CONNECTIONS), format_func=CONNECTIONS.__getitem__,
-        key="connection_mode", horizontal=True, on_change=_connection_changed,
-    )
-    configured = st.session_state.connection_mode == "configured"
-    st.caption("Automatic reuses verified saved connections only on the same GitLab host, then a matching configured connection. An entered token takes precedence.")
     with st.form("inspect-link", clear_on_submit=False, enter_to_submit=True):
-        url = st.text_input(
-            "GitLab pipeline, job, branch, file or repository URL", key="inspection_url",
-            placeholder="https://gitlab.example/group/project/-/pipelines/123", max_chars=2048,
-        )
-        token = st.text_input(
-            "Read-only GitLab token", type="password", key="read_only_token", disabled=configured,
-            help="Optional for Automatic. Use read_api/read_repository access. The password field is cleared after each attempt; the URL and settings stay visible.",
-        )
-        st.checkbox(
-            "Save token encrypted on this Windows account", key="remember_token",
-            disabled=configured or not status.get("vault_available", False),
-            help="Explicit consent to Windows DPAPI storage outside project data after access verification. No plaintext fallback. Unchecked new tokens are request-only; existing saved connections can still be reused.",
-        )
-        if not status.get("vault_available"):
-            st.caption("Windows encrypted storage is unavailable. New tokens will not be saved.")
-        st.checkbox(
-            "Force refresh", key="force_refresh",
-            help="Bypass the short-lived result snapshot. Access is rechecked even when a snapshot is reused.",
-        )
-        submitted = st.form_submit_button("Analyze", type="primary", on_click=_begin_submission)
+        link_column, action_column = st.columns((5, 1), vertical_alignment="bottom")
+        with link_column:
+            url = st.text_input(
+                "GitLab link", key="inspection_url", max_chars=2048,
+                placeholder="Paste a pipeline, job, branch or project URL",
+                help="Pipeline and job links inspect that run. Branch, file and project links resolve their latest pipeline or inspect configuration when no run exists.",
+            )
+        with action_column:
+            submitted = st.form_submit_button(
+                "Analyze", type="primary", on_click=_begin_submission,
+                use_container_width=True,
+            )
+        with st.expander("Connection & options", expanded=False):
+            st.radio(
+                "GitLab connection", list(CONNECTIONS), format_func=CONNECTIONS.__getitem__,
+                key="connection_mode", horizontal=True,
+            )
+            st.caption("Automatic reuses a saved or configured same-host connection. A new token is used only for this request unless you choose to save it. Configured connection ignores this field.")
+            token = st.text_input(
+                "Read-only GitLab token", type="password", key="read_only_token",
+                help="Use read_api/read_repository access. Only this field is cleared after an attempt; your link and settings stay visible.",
+            )
+            st.checkbox(
+                "Save token encrypted on this Windows account", key="remember_token",
+                disabled=not status.get("vault_available", False),
+                help="Opt in to Windows DPAPI storage after access verification. Saved tokens stay on this laptop and are only reused on the same GitLab host.",
+            )
+            if not status.get("vault_available"):
+                st.caption("Windows encrypted storage is unavailable. New tokens will not be saved.")
+            st.checkbox(
+                "Force refresh", key="force_refresh",
+                help="Reread evidence instead of using a short-lived snapshot. GitLab access is always rechecked.",
+            )
+            st.checkbox(
+                "Save diagnostic notes locally", key="remember_analysis",
+                help="Save redacted diagnostic notes on this device. No telemetry or uploads. Turn off before Analyze to skip new notes; existing notes are not deleted. This is separate from saving a token.",
+            )
+            st.checkbox(
+                "Ask a cloud assist if the cause is unknown (optional, off by default)",
+                key="ask_cloud_ai",
+                disabled=not status.get("cloud_assist_configured", False),
+                help=(
+                    "Sends only the already-redacted rule, category and evidence text of the "
+                    "one unresolved finding to the locally configured cloud provider "
+                    f"({status.get('cloud_assist_provider') or 'none configured'}). Nothing is "
+                    "sent unless this is checked for this analysis and a provider is configured "
+                    "locally. Every other analysis stays fully local."
+                ),
+            )
+            if not status.get("cloud_assist_configured"):
+                st.caption("Cloud assist is not configured on this local API; analysis stays fully local.")
+    # The disclosure stays visible even when the connection options are closed.
+    st.caption(LOCAL_NOTES_NOTICE if st.session_state.remember_analysis else "Diagnostic note saving is off for the next analysis; existing notes stay on this device.")
     if submitted:
         _inspect_submission(status, url, token)
     if st.session_state.submission_failed:
@@ -297,13 +420,25 @@ def _outcome(item: dict[str, Any]) -> str:
 
 def _ordered_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
     def priority(finding: dict[str, Any]) -> tuple[int, int]:
-        causal = (
-            finding.get("job_id") and finding.get("category") not in _CONTEXT_CATEGORIES
+        actionable = (
+            finding.get("category") not in _CONTEXT_CATEGORIES
             and not str(finding.get("rule_id", "")).startswith(("pipeline.", "ci.visibility"))
             and finding.get("severity") in {"error", "warning"}
         )
+        if finding.get("job_id") and finding.get("severity") == "error":
+            rank = 0 if actionable else 1
+        elif finding.get("severity") == "error" and finding.get("category") in {"pipeline_status", "downstream_pipeline", "job_status"}:
+            rank = 2
+        elif actionable:
+            rank = 3 if finding.get("job_id") else 4
+        elif finding.get("severity") in {"error", "warning"} and finding.get("category") in {"job_status", "pipeline_status", "downstream_pipeline", "unknown"}:
+            rank = 5
+        elif finding.get("category") == "no_failure_observed":
+            rank = 6
+        else:
+            rank = 7
         return (
-            0 if causal else 1,
+            rank,
             {"error": 0, "warning": 1, "info": 2}.get(finding.get("severity", "info"), 2),
         )
 
@@ -311,35 +446,311 @@ def _ordered_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(_objects(result.get("findings")), key=priority)
 
 
+def _genuine_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    context = _CONTEXT_CATEGORIES - {"unknown"}
+    seen: set[str] = set()
+    issues = []
+    for finding in findings:
+        key = finding_identity(finding)
+        if (
+            finding.get("severity") in {"error", "warning"}
+            and finding.get("category") not in context
+            and not str(finding.get("rule_id") or "").startswith(("pipeline.", "ci.visibility"))
+            and key not in seen
+        ):
+            issues.append(finding)
+            seen.add(key)
+    return issues
+
+
+def _select_finding(result: dict[str, Any], findings: list[dict[str, Any]]) -> dict[str, Any]:
+    issues = _genuine_findings(findings)
+    if len(issues) > 1:
+        selected = st.selectbox(
+            "Issue", range(len(issues)), key=f"issue-{_result_key(result)}",
+            format_func=lambda index: _brief(issues[index].get("title"), 150)
+            + (" · " + _job_label(result, issues[index]["job_id"]) if issues[index].get("job_id") else ""),
+        )
+        return issues[selected]
+    return issues[0] if issues else findings[0] if findings else {}
+
+
+def _remediation_for(result: dict[str, Any], finding: dict[str, Any]) -> dict[str, Any]:
+    if not finding.get("rule_id"):
+        return {}
+    key = finding_identity(finding)
+    return next((item for item in _objects(result.get("remediations")) if (
+        item.get("rule_id") == finding["rule_id"]
+        and str(item.get("job_id") or "") == str(finding.get("job_id") or "")
+        and (not item.get("finding_key") or item["finding_key"] == key)
+    )), {})
+
+
+def _root_finding(result: dict[str, Any], finding: dict[str, Any]) -> bool:
+    return not finding.get("job_id") or str(finding["job_id"]) in {
+        str(job.get("external_id")) for job in _objects(result.get("jobs"))
+    }
+
+
+def _confidence(remediation: dict[str, Any], field: str) -> int | float | None:
+    value = remediation.get(field)
+    if (
+        remediation.get("score_label") == SCORE_LABEL
+        and isinstance(value, (int, float)) and not isinstance(value, bool)
+        and 0 <= value <= 100
+    ):
+        return value
+    return None
+
+
+def _render_confidence(remediation: dict[str, Any]) -> None:
+    meanings = (
+        ("Cause confidence", "cause_confidence", "Evidence supporting the identified cause, not just the pipeline outcome."),
+        ("Fix confidence", "fix_confidence", "Evidence supporting the proposed correction, not its chance of succeeding."),
+    )
+    for column, (label, field, meaning) in zip(st.columns(2), meanings, strict=True):
+        value = _confidence(remediation, field)
+        with column:
+            st.metric(
+                label, f"{value:g}/100" if value is not None else "Unknown",
+                help=f"{meaning} {SCORE_LABEL}. No target verification. Unknown means no supported numeric score was supplied by the API.",
+            )
+
+
+def _source_proposals(remediation: dict[str, Any]) -> list[dict[str, Any]]:
+    # The API verifies source applicability. The UI only checks the display shape;
+    # it never synthesizes a patch, reapplies it, or claims target verification.
+    proposals = []
+    for item in _objects(remediation.get("proposals")):
+        diff = item.get("diff")
+        if (
+            item.get("kind") == "source_diff" and isinstance(diff, str)
+            and isinstance(item.get("path"), str) and item["path"].strip()
+            and re.search(r"(?m)^--- .+\r?\n\+\+\+ .+\r?$", diff)
+            and re.search(r"(?m)^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", diff)
+            and re.search(r"(?m)^[+-](?![+-])", diff)
+        ):
+            proposals.append(item)
+    return proposals
+
+
+def _changed_line(diff: str) -> int | None:
+    line = None
+    for text in diff.splitlines():
+        if match := re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", text):
+            line = int(match[1])
+        elif line is not None:
+            if text.startswith(("-", "+")):
+                return max(1, line)
+            if text.startswith(" "):
+                line += 1
+    return None
+
+
+def _source_location(source: dict[str, Any], *, proposal: bool = False) -> None:
+    path = str(source.get("path") or "Source path unavailable")
+    ref = str(source.get("ref") or "")
+    url = _safe_url(source.get("source_url"))
+    # Do not substitute the CI definition, or label a different file as the source.
+    if url and not unquote(urlsplit(url).path).endswith(f"/-/blob/{ref}/{path}"):
+        url = None
+    line = source.get("line_start")
+    line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
+    end = source.get("line_end")
+    end = end if isinstance(end, int) and not isinstance(end, bool) and line and end >= line else None
+    if proposal:
+        fragment = urlsplit(url).fragment if url else ""
+        match = re.fullmatch(r"L([1-9]\d*)(?:-L?([1-9]\d*))?", fragment)
+        line = int(match[1]) if match else _changed_line(str(source.get("diff") or ""))
+        end = int(match[2]) if match and match[2] else None
+    label = path
+    if line:
+        label += f" · lines {line}–{end}" if end and end != line else f" · line {line}"
+        if url:
+            parts = urlsplit(url)
+            url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", f"L{line}" + (f"-{end}" if end and end != line else "")))
+    reference = f" · ref {_md(_brief(ref, 48))}" if ref else ""
+    if url:
+        st.markdown(f"[{_md(label)}](<{url}>){reference}")
+    else:
+        st.caption(_md(label) + reference)
+
+
+def _render_source_block(remediation: dict[str, Any]) -> None:
+    source = next((item for item in _objects(remediation.get("source_blocks")) if (
+        isinstance(item.get("content"), str) and item["content"]
+    )), None)
+    if source is None:
+        st.caption("Source context was not supplied; no file change was guessed.")
+        return
+    _source_location(source)
+    content = source["content"]
+    excerpt = "".join(content.splitlines(keepends=True)[:MAX_SOURCE_LINES])[:MAX_SOURCE_CHARS]
+    language = source.get("language")
+    language = language if isinstance(language, str) and language in _SOURCE_LANGUAGES else "text"
+    _exact_code(excerpt, language=language)
+    if len(excerpt) < len(content):
+        st.caption("Exact source prefix shown: at most 80 lines / 8,000 characters. Open the source for the rest; no omitted code was reconstructed.")
+
+
+def _deployment_summary_evidence(finding: dict[str, Any], remediation: dict[str, Any]) -> dict[str, Any] | None:
+    # Only these artifact-backed rules replace the no-patch source preview.
+    if finding.get("rule_id") not in (
+        "rlp.datasync_field_mapping_connection_reset",
+        "rlp.datasync_field_mapping_artifact_failure",
+    ) or any(
+        len(item["diff"]) <= MAX_DIFF_CHARS and len(item["diff"].splitlines()) <= MAX_DIFF_LINES
+        for item in _source_proposals(remediation)
+    ):
+        return None
+    return next((item for item in _objects(finding.get("evidence")) if (
+        item.get("path") == "datasync/deploy-summary.json"
+        and isinstance(item.get("text"), str) and item["text"].strip()
+    )), None)
+
+
+def _render_deployment_summary(evidence: dict[str, Any]) -> None:
+    # Reflow the supplied counter groups, not artifact JSON or reconstructed code.
+    # Redact the entire text before bounding it, including secrets across the cutoff.
+    text = redact_text(evidence["text"])
+    if text.startswith("DataSync deploy summary counters: "):
+        text = text.removeprefix("DataSync deploy summary counters: ")
+        text = re.sub(r"; (?=(?:field mappings|object mappings|value transformations): )", "\n", text)
+        text = text.replace(". A bounded actual field-mapping failure", ".\nA bounded actual field-mapping failure", 1)
+    excerpt = "".join(text.splitlines(keepends=True)[:MAX_SUMMARY_LINES])[:MAX_SUMMARY_CHARS]
+    st.caption("Deployment summary · " + _md(evidence["path"]))
+    st.code(excerpt, language="text", wrap_lines=True)
+    if len(excerpt) < len(text):
+        st.caption("Summary excerpt; more evidence is available in Evidence & details or the cited source.")
+    _link("Deployment summary source", evidence.get("source_url"))
+
+
+def _render_documentation(remediation: dict[str, Any], finding: dict[str, Any]) -> None:
+    links = []
+    seen: set[str] = set()
+    for owner in (remediation, finding):
+        entries = owner.get("documentation")
+        for item in entries if isinstance(entries, list) else []:
+            url = _documentation_url(item.get("url") if isinstance(item, dict) else item)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            host = urlsplit(url).hostname
+            label = _brief(item.get("title"), 90) if isinstance(item, dict) else ""
+            links.append(f"[{_md(label or _DOC_HOSTS.get(host or '', 'Documentation'))}](<{url}>)")
+            if len(links) == 3:
+                break
+        if len(links) == 3:
+            break
+    if links:
+        st.markdown(" · ".join(links))
+
+
+def _recommended_actions(finding: dict[str, Any], remediation: dict[str, Any]) -> list[str]:
+    fixes = _text_items(finding.get("fix"))
+    actions = _text_items(remediation.get("actions"))
+    generic = re.compile(r"(?:review|inspect|read|check) (?:the )?(?:logs?|evidence|diagnostics?|job logs?|source|source access)[.!]?", re.I)
+    for candidates in (fixes, actions):
+        specific = [item for item in candidates if not generic.fullmatch(item)]
+        if specific:
+            return specific
+    return fixes or actions
+
+
+def _render_answer(finding: dict[str, Any], remediation: dict[str, Any]) -> None:
+    explanation = finding.get("explanation") or remediation.get("summary") or "The available evidence did not establish a cause or a specific correction."
+    summary = re.split(r"\bObserved:\s*", str(explanation), maxsplit=1, flags=re.I)[0].strip()
+    st.markdown(_md(_brief(summary or remediation.get("summary") or "A cause has not been established.")))
+    _render_confidence(remediation)
+    proposals = _source_proposals(remediation)
+    bounded = [item for item in proposals if len(item["diff"]) <= MAX_DIFF_CHARS and len(item["diff"].splitlines()) <= MAX_DIFF_LINES]
+    summary_evidence = _deployment_summary_evidence(finding, remediation)
+    if summary_evidence:
+        _render_deployment_summary(summary_evidence)
+    for proposal in bounded[:MAX_PROPOSALS]:
+        title = _brief(proposal.get("title"), 160)
+        if title:
+            st.markdown("**" + _md(title) + "**")
+        _source_location(proposal, proposal=True)
+        condition = _brief(proposal.get("condition"), 320)
+        st.caption(_md(condition or "Conditional suggestion; confirm the intended behavior before changing source."))
+        _exact_code(proposal["diff"], language="diff")
+        verification = _text_items(proposal.get("verification"))
+        if verification:
+            st.markdown("**Verify**")
+            _numbered_steps(verification)
+        else:
+            st.caption("No proposal-specific verification steps were supplied.")
+    if bounded:
+        st.caption("Review only · not applied or target-verified.")
+    else:
+        st.markdown("**No verified source patch**" if not proposals else "**No verified source patch shown**")
+        actions = _recommended_actions(finding, remediation)
+        if actions:
+            _numbered_steps(actions)
+        else:
+            st.caption("Obtain the missing diagnostic before choosing a correction.")
+    if len(bounded) > MAX_PROPOSALS:
+        st.caption(f"Showing {MAX_PROPOSALS} of {len(bounded)} source proposals.")
+    if len(proposals) > len(bounded):
+        st.caption("An oversized source patch was not shown: the limit is 16,000 characters / 240 lines. No truncated or reconstructed diff is presented.")
+    fix_confidence = _confidence(remediation, "fix_confidence")
+    if not bounded or fix_confidence is None or fix_confidence < LOW_FIX_CONFIDENCE:
+        _render_documentation(remediation, finding)
+        if not summary_evidence:
+            _render_source_block(remediation)
+
+
+def _render_remediation_details(remediation: dict[str, Any], finding: dict[str, Any], result: dict[str, Any]) -> None:
+    st.caption(SCORE_LABEL + ". No target verification; source applicability does not prove a resolution.")
+    for basis in _text_items(remediation.get("confidence_basis"))[:12]:
+        st.markdown("- " + _md(_brief(basis, 800)))
+    missing = _text_items(remediation.get("missing_information"))
+    if missing:
+        st.markdown("**Missing information**")
+        for item in missing[:10]:
+            st.markdown("- " + _md(_brief(item, 800)))
+    matches = result.get("corpus_matches")
+    match = (matches.get(finding.get("rule_id")) if isinstance(matches, dict)
+             and _root_finding(result, finding) else None)
+    if isinstance(match, dict):
+        counts = [match.get("seen_failed_pipelines"), match.get("failed_jobs")]
+        if all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in counts):
+            st.caption(f"Local history: {counts[0]} failed pipelines · {counts[1]} failed jobs with this rule. Occurrence counts, not verified fixes or calibrated confidence.")
+    for proposal in _source_proposals(remediation)[:MAX_PROPOSALS]:
+        if proposal.get("rationale"):
+            st.markdown("**" + _md(_brief(proposal.get("title") or proposal.get("path"), 160)) + "**")
+            st.markdown(_md(_brief(proposal["rationale"], 1200)))
+        _numbered_steps(_text_items(proposal.get("verification"))[3:], start=4, limit=10)
+    _render_documentation(remediation, finding)
+    if _deployment_summary_evidence(finding, remediation) and any(
+        isinstance(item.get("content"), str) and item["content"]
+        for item in _objects(remediation.get("source_blocks"))
+    ):
+        _render_source_block(remediation)
+
+
 def _render_outcome(result: dict[str, Any]) -> None:
     pipeline = result.get("pipeline") or {}
     outcome = _outcome(pipeline)
     status = result["status"]
     if status == "configuration_only":
-        st.info("Configuration-only inspection · no pipeline run was available. Static checks are not runtime evidence.")
+        message = "Configuration only · no pipeline run. Static checks are not runtime evidence."
     elif outcome in _SUCCESS and status == "passed":
-        st.success("GitLab reported pipeline success · no failure observed in the sampled evidence.")
+        message = "Pipeline passed · no failure observed in sampled evidence."
     elif outcome in _SUCCESS:
-        message = "GitLab reported pipeline success · inspection warning. "
         allowed = [job for job in _objects(result.get("jobs")) if _outcome(job) in _FAILED and job.get("allow_failure")]
-        if allowed:
-            message += f"{len(allowed)} failed job(s) have allow_failure=true, so they need not fail the pipeline. "
-        message += "Warnings do not override GitLab's reported pipeline outcome; CI execution policy is unchanged."
-        st.warning(message)
+        message = "Pipeline passed · " + (f"{len(allowed)} allowed failure(s), allow_failure=true." if allowed else "inspection warning.")
     elif outcome in _FAILED:
-        st.error("GitLab reported pipeline " + _md(outcome) + " · the job evidence below explains the cause when established.")
+        message = f"Pipeline {outcome}."
     elif status == "in_progress":
-        st.info("GitLab pipeline is " + _md(outcome) + " · no final outcome is available yet.")
+        message = f"Pipeline {outcome} · no final outcome yet."
     else:
-        st.warning("Inspection warning · GitLab pipeline status: " + _md(outcome) + ". Status alone does not establish a cause.")
+        message = f"Pipeline {outcome} · status alone does not establish a cause."
     selected = result.get("selected_job")
     if isinstance(selected, dict):
-        text = f"Selected job {selected.get('name', '')} (#{selected.get('external_id', '')}) reported {_outcome(selected)}. "
-        text += (
-            "It is not declared failed; warnings or other job findings are separate context."
-            if _outcome(selected) in _SUCCESS else "Its outcome is separate from the overall pipeline outcome."
-        )
-        st.info(_md(text))
+        message += f" Selected job {selected.get('name', '')}: {_outcome(selected)}; parent findings are separate."
+    st.caption(_md(message))
 
 
 def _job_label(result: dict[str, Any], job_id: object) -> str:
@@ -370,39 +781,59 @@ def _finding_body(finding: dict[str, Any], result: dict[str, Any]) -> None:
     else:
         context += " · Pipeline metadata / static context; not a proven runtime cause"
     st.caption(_md(context))
-    st.markdown("**Why**")
-    st.markdown(_md(finding.get("explanation") or "No cause was established from the available evidence."))
-    st.markdown("**Probable correct fix — review before making changes**")
+    explanation = str(finding.get("explanation") or "No cause was established from the available evidence.")
+    # The diagnostic's verbatim quote is shown once below, not repeated in its prose.
+    summary = explanation.partition(" Observed: ")[0]
+    st.markdown("**What happened**")
+    st.markdown(_md(summary))
+    st.markdown("**Recommended fix**")
     fixes = finding.get("fix") or []
     if not fixes:
         st.write("Obtain the missing diagnostic before choosing a fix; do not change CI execution policy from status alone.")
-    for index, step in enumerate(fixes[:3], 1):
-        st.markdown(f"{index}. {_md(step)}")
+    _numbered_steps(fixes)
     evidence = _objects(finding.get("evidence"))
     if evidence:
-        st.markdown("**Quoted evidence**")
+        st.markdown("**Evidence**")
         _evidence(evidence[0])
         # Keep the short quote singular, but surface the authoritative source-file link too.
         for item in evidence[1:3]:
             if item.get("path"):
                 _link(str(item["path"]) + (f" · line {item['line']}" if item.get("line") else ""), item.get("source_url"))
+    if finding.get("job_id"):
+        analysis = next((item for item in _objects(result.get("analyses")) if str(item.get("job", {}).get("external_id")) == str(finding["job_id"])), {})
+        source = analysis.get("job_source") or {}
+        if source.get("source_url"):
+            label = f"CI definition · {display_include_path(source['path'])} · lines {source.get('line_start')}–{source.get('line_end')}"
+            _link(label, source["source_url"])
 
 
 def _finding_details(finding: dict[str, Any]) -> None:
     with st.expander("More evidence, safe steps & references", expanded=False):
         st.caption(_md(f"Rule: {finding.get('rule_id', 'unknown')} · Category: {finding.get('category', 'unknown')}"))
-        for index, step in enumerate((finding.get("fix") or [])[3:], 4):
-            st.markdown(f"{index}. {_md(step)}")
+        st.write(_md(finding.get("explanation") or "No additional explanation supplied."))
+        _numbered_steps(_text_items(finding.get("fix"))[3:], start=4, limit=10)
         for item in _objects(finding.get("evidence")):
             _evidence(item, short=False)
-        for url in (finding.get("documentation") or [])[:5]:
-            _link("Documentation", url)
+        _render_documentation({}, finding)
 
 
 def _render_summary(result: dict[str, Any]) -> None:
     repository = result["repository"]
     pipeline = result.get("pipeline") or {}
-    with st.container(border=True):
+    parts = [f"{repository.get('owner', '')}/{repository.get('name', '')}"]
+    if pipeline.get("external_id"):
+        parts.append(f"Pipeline #{pipeline['external_id']}")
+    if pipeline.get("ref_name"):
+        parts.append(pipeline["ref_name"])
+    freshness = f"Cached · {result.get('cache_age_seconds', 0)}s old" if result.get("cached") else "Fresh"
+    parts.extend([freshness, f"{result.get('elapsed_ms', 0) / 1000:.1f}s"])
+    st.caption(_md(" · ".join(parts)))
+
+
+def _render_scope_details(result: dict[str, Any]) -> None:
+    repository = result["repository"]
+    pipeline = result.get("pipeline") or {}
+    with st.expander("Inspection details", expanded=False):
         st.markdown("**Examined link & scope**")
         st.caption(_md(f"{repository.get('owner', '')}/{repository.get('name', '')} · Reference: {result.get('reference_kind', 'unknown')}"))
         _link("Submitted URL (canonical)", result.get("submitted_url"))
@@ -447,10 +878,11 @@ def _result_key(result: dict[str, Any]) -> str:
 def _render_diagnosis_details(result: dict[str, Any], findings: list[dict[str, Any]]) -> None:
     if findings:
         _finding_details(findings[0])
-    with st.expander(f"Other findings ({max(0, len(findings) - 1)})", expanded=False):
-        if len(findings) < 2:
+    additional = [finding for finding in findings[1:] if finding.get("rule_id") != "pipeline.failed"]
+    with st.expander("Additional evidence & context", expanded=False):
+        if not additional:
             st.caption("No additional findings were returned in this bounded inspection.")
-        for finding in findings[1:]:
+        for finding in additional:
             with st.expander(_md(f"{str(finding.get('severity', 'info')).title()} · {finding.get('title', 'Finding')}"), expanded=False):
                 _finding_body(finding, result)
                 _finding_details(finding)
@@ -614,6 +1046,8 @@ def _render_connections(status: dict[str, Any]) -> None:
 
 
 def _render_confirmation(result: dict[str, Any], findings: list[dict[str, Any]]) -> None:
+    # Root-project notes must never claim a correction confirmed for a child repo.
+    findings = [finding for finding in findings if _root_finding(result, finding)]
     with st.expander("Previously human-confirmed resolutions", expanded=False):
         confirmed = [item for item in _objects(result.get("confirmed_resolutions")) if item.get("human_confirmed") is True]
         st.caption("These are prior user assertions for the project/rule, not fixes revalidated for this run.")
@@ -688,47 +1122,62 @@ def _render_memory(status: dict[str, Any], result: dict[str, Any] | None, findin
     _render_export()
 
 
+def _render_retention(result: dict[str, Any]) -> None:
+    requested = result.get("_remember_analysis_requested")
+    saved = result.get("knowledge_saved")
+    if requested is False:
+        if saved is True:
+            st.warning("The API reports diagnostic notes were saved despite opting out. Update the local API before analyzing again; the UI cannot undo that retention.")
+        elif saved is False:
+            st.caption("No diagnostic notes saved for this analysis.")
+        else:
+            st.warning("Note saving was turned off, but the API did not confirm whether notes were retained.")
+
+
+def _render_cloud_assist(result: dict[str, Any]) -> None:
+    assist = result.get("cloud_assist")
+    summary = assist.get("summary") if isinstance(assist, dict) else None
+    if not isinstance(summary, str) or not summary.strip():
+        return
+    provider = assist.get("provider")
+    label = _brief(provider, 40).title() if isinstance(provider, str) and provider.strip() else "cloud"
+    st.markdown(f"**Cloud assist ({_md(label)}) \u00b7 optional, unverified**")
+    notice = assist.get("notice") if isinstance(assist.get("notice"), str) else "Unverified cloud opinion; separate from the local diagnosis. Review independently."
+    st.caption(_md(_brief(notice, 260)))
+    st.write(_md(_brief(summary, 1200)))
+
+
 def run() -> None:
     st.set_page_config(page_title="PipelineLens", page_icon="PL", layout="wide", initial_sidebar_state="collapsed")
     _initialize_state()
     _render_styles()
     st.title("PipelineLens")
-    st.info("Local rules • no external AI calls")
-    st.caption("Understand the cause. Review the safe fix. Expand evidence only when needed.")
+    st.caption("Find the cause. See the fix. Local rules by default · optional cloud assist stays off unless you turn it on.")
     status = _local_status()
     _render_input(status)
     result = st.session_state.inspection_result
     findings = _ordered_findings(result) if result else []
     if result is not None:
-        if findings:
-            primary = findings[0]
-            st.subheader(_md(f"{str(primary.get('severity', 'info')).title()} · {primary.get('title', 'Inspection finding')}"))
-        else:
-            st.subheader("No causal finding established")
+        primary = _select_finding(result, findings)
+        remediation = _remediation_for(result, primary)
+        st.subheader(_md(_brief(primary.get("title") or "No causal finding established", 200)))
         _render_outcome(result)
-        if findings:
-            _finding_body(findings[0], result)
-        else:
-            st.write("The available evidence did not establish a cause or a specific correction. Review the inspection scope before choosing a fix.")
-        _render_summary(result)
-    diagnosis, context, sources, memory = st.tabs(["Diagnosis", "Pipeline context", "CI sources & files", "Local memory"])
-    with diagnosis:
-        if result is not None:
-            _render_diagnosis_details(result, findings)
-        elif not st.session_state.submission_failed:
-            st.info("Paste a supported GitLab link and press Enter or Analyze. A branch, file or repository link resolves to its branch's latest pipeline, or a configuration-only inspection if no pipeline exists.")
-    with context:
-        if result is not None:
+        _render_answer(primary, remediation)
+        _render_cloud_assist(result)
+        _render_retention(result)
+        with st.expander("Evidence & details", expanded=False):
+            _render_summary(result)
+            _render_remediation_details(remediation, primary, result)
+            ordered = [primary] + [item for item in findings if item is not primary] if primary else findings
+            _render_diagnosis_details(result, ordered)
+            _render_scope_details(result)
             _render_pipeline_context(result)
-        else:
-            st.caption("Pipeline and job context will appear after a successful inspection.")
-    with sources:
-        if result is not None:
             _render_sources(result)
-        else:
-            st.caption("CI source visibility and the bounded file inventory will appear here.")
-    with memory:
-        _render_memory(status, result, findings)
+            with st.expander("Local settings & history", expanded=False):
+                _render_memory(status, result, findings)
+    else:
+        with st.expander("Settings", expanded=False):
+            _render_memory(status, None, [])
 
 
 if __name__ == "__main__":

@@ -6,21 +6,24 @@ import asyncio
 import inspect
 from collections import Counter
 from dataclasses import replace
+from unittest.mock import patch
 from urllib.parse import quote
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from pipelinelens.config import Settings
-from pipelinelens.domain import CiConfigAccessReport, DownloadState
-from pipelinelens.providers.base import ProviderError
-from pipelinelens.providers.gitlab import GitLabProvider
-from pipelinelens.services import inspection
-from pipelinelens.services.analysis import AnalysisInput, PipelineAnalyzer
-from pipelinelens.services.gitlab_includes import project_include_key
-from pipelinelens.services.inspection import InspectionResult, inspect_gitlab
-from pipelinelens.services.pipeline_url import PipelineUrlError, parse_gitlab_url
+# These fixtures must not load ambient credentials from the project's dotenv file.
+with patch("dotenv.load_dotenv", return_value=False):
+    from pipelinelens.config import Settings
+    from pipelinelens.domain import CiConfigAccessReport, DownloadState
+    from pipelinelens.providers.base import ProviderError
+    from pipelinelens.providers.gitlab import GitLabProvider
+    from pipelinelens.services import inspection
+    from pipelinelens.services.analysis import AnalysisInput, PipelineAnalyzer
+    from pipelinelens.services.gitlab_includes import project_include_key
+    from pipelinelens.services.inspection import InspectionResult, inspect_gitlab
+    from pipelinelens.services.pipeline_url import PipelineUrlError, parse_gitlab_url
 
 ORIGIN = "https://gitlab.test"
 SHA = "a" * 40
@@ -149,6 +152,8 @@ class GitLabStub:
                 return payload
             if type(payload) is int:
                 return httpx.Response(payload, json={"message": TOKEN + " private upstream body"})
+            if isinstance(payload, bytes):
+                return httpx.Response(200, content=payload)
             return (httpx.Response(200, text=payload) if isinstance(payload, str)
                     else httpx.Response(200, json=payload))
         finally:
@@ -183,6 +188,112 @@ async def gitlab():
 
 def job(job_id: int, name: str = "build", status: str = "failed", **kwargs) -> dict:
     return {"id": job_id, "name": name, "status": status, **kwargs}
+
+
+def datasync_artifact() -> bytes:
+    import io
+    import json
+    import zipfile
+
+    stream = io.BytesIO()
+    summary = {
+        "fieldMappings": {
+            "deployed": 12,
+            "failed": 1,
+            "skipped": 9,
+            "failures": [{
+                "status": "failed",
+                "error": "ConnectionResetError: connection reset by peer",
+            }],
+        },
+        "mappings": {"updated": 2},
+    }
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("datasync/deploy-summary.json", json.dumps(summary))
+    return stream.getvalue()
+
+
+async def test_datasync_artifact_explains_generic_deployment_wrapper(gitlab):
+    gitlab.add_pipeline(RUN_ID, "failed")
+    gitlab.set_jobs([
+        job(91, "deploy-datasync-job", failure_reason="script_failure"),
+    ])
+    gitlab.responses["/projects/42/jobs/91/trace"] = (
+        "DEPLOYMENT STEP FAILED\nError: deployment failed\nERROR: Job failed: exit code 1"
+    )
+    gitlab.responses["/projects/42/jobs/91/artifacts"] = datasync_artifact()
+
+    result = await gitlab.inspect(max_jobs=1)
+
+    findings = {finding.rule_id: finding for finding in result.findings}
+    assert "deployment.failed" in findings
+    artifact = findings["rlp.datasync_field_mapping_connection_reset"]
+    assert artifact.confidence == "observed"
+    assert artifact.owner == "RLP DataSync / target platform"
+    assert artifact.job_id == "91"
+    assert artifact.evidence[0].path == "datasync/deploy-summary.json"
+    assert artifact.evidence[0].source_url.endswith(
+        "/jobs/91/artifacts/file/datasync/deploy-summary.json"
+    )
+    assert result.findings.index(artifact) < result.findings.index(findings["deployment.failed"])
+
+
+@pytest.mark.parametrize("pipeline_status, allowed, severity", [
+    ("failed", False, "error"),
+    ("failed", True, "warning"),
+    ("success", False, "warning"),
+    ("success", True, "warning"),
+])
+async def test_datasync_artifact_respects_pipeline_outcome_and_allowed_failure(
+    gitlab, pipeline_status, allowed, severity,
+):
+    gitlab.add_pipeline(RUN_ID, pipeline_status)
+    gitlab.set_jobs([job(91, "deploy-datasync-job", allow_failure=allowed)])
+    gitlab.responses["/projects/42/jobs/91/artifacts"] = datasync_artifact()
+
+    result = await gitlab.inspect(max_jobs=1)
+
+    finding = next(item for item in result.findings
+                   if item.rule_id == "rlp.datasync_field_mapping_connection_reset")
+    assert finding.severity == severity
+    assert finding.confidence == "observed"
+    assert ("allow_failure=true" in finding.explanation) is allowed
+    assert result.pipeline.status == pipeline_status
+    if pipeline_status == "success":
+        assert result.status == "warning"
+
+
+async def test_successful_datasync_job_never_requests_artifact_archive(gitlab):
+    gitlab.set_jobs([job(91, "deploy-datasync-job", "success")])
+
+    await gitlab.inspect(max_jobs=1)
+
+    assert not any(request.url.path.endswith("/artifacts") for request in gitlab.calls)
+
+
+async def test_non_datasync_job_never_requests_an_artifact_archive(gitlab):
+    gitlab.set_jobs([job(92, "deploy-schema-job", failure_reason="script_failure")])
+
+    await gitlab.inspect(max_jobs=1)
+
+    assert not any(request.url.path.endswith("/artifacts") for request in gitlab.calls)
+
+
+async def test_only_one_failed_datasync_artifact_is_read_per_pipeline(gitlab):
+    gitlab.set_jobs([
+        job(93, "deploy-datasync-job", failure_reason="script_failure"),
+        job(94, "validate-datasync-job", failure_reason="script_failure"),
+    ])
+    for job_id in (93, 94):
+        gitlab.responses[f"/projects/42/jobs/{job_id}/artifacts"] = datasync_artifact()
+
+    result = await gitlab.inspect(max_jobs=2)
+
+    archive_requests = [request.url.path for request in gitlab.calls
+                        if request.url.path.endswith("/artifacts")]
+    assert archive_requests == ["/api/v4/projects/42/jobs/93/artifacts"]
+    assert [finding.job_id for finding in result.findings
+            if finding.rule_id == "rlp.datasync_field_mapping_connection_reset"] == ["93"]
 
 
 def linked_mr(stub: GitLabStub, iid: int = 7, head: str = SHA, rows: list | None = None) -> None:
@@ -549,6 +660,86 @@ async def test_matching_mr_head_uses_diffs_and_exposes_only_allowlisted_metadata
     } for item in result.changes)
     assert "@@" not in result.model_dump_json()
     assert "PRIVATE-" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("status", [404, 405])
+@pytest.mark.parametrize("has_mr", [False, True])
+async def test_unsupported_pipeline_mr_endpoint_falls_back_without_false_partial(
+    gitlab, status, has_mr,
+):
+    primary = f"/projects/42/pipelines/{RUN_ID}/merge_requests"
+    fallback = f"/projects/42/repository/commits/{SHA}/merge_requests"
+    if has_mr:
+        linked_mr(gitlab)
+    gitlab.responses[fallback] = gitlab.responses[primary]
+    gitlab.responses[primary] = status
+    result = await gitlab.inspect()
+
+    assert gitlab.count(primary) == gitlab.count(fallback) == 1
+    assert result.status == "passed"
+    assert len(result.merge_requests) == int(has_mr)
+    assert gitlab.count("/projects/42/merge_requests/7/diffs") == int(has_mr)
+    assert gitlab.count(f"/projects/42/repository/commits/{SHA}/diff") == int(not has_mr)
+    assert any("commit-linked" in note for note in result.notes)
+    assert not any("inspection is partial" in note for note in result.notes)
+    assert all(request.url.params["per_page"] == "2" for request in gitlab.calls
+               if request.url.path.endswith("/merge_requests"))
+
+
+async def test_successful_empty_pipeline_mr_list_does_not_add_commit_association_read(gitlab):
+    result = await gitlab.inspect()
+    assert result.status == "passed" and result.merge_requests == []
+    assert gitlab.count(f"/projects/42/repository/commits/{SHA}/merge_requests") == 0
+    assert gitlab.count(f"/projects/42/repository/commits/{SHA}/diff") == 1
+
+
+async def test_successful_commit_mr_fallback_preserves_unrelated_partial_evidence(gitlab):
+    gitlab.yield_requests = True
+    gitlab.responses[f"/projects/42/pipelines/{RUN_ID}/merge_requests"] = 404
+    gitlab.responses[f"/projects/42/repository/commits/{SHA}/merge_requests"] = []
+    gitlab.set_jobs([job(1, "build", "success")])
+    gitlab.responses["/projects/42/jobs/1/trace"] = 403
+    result = await gitlab.inspect()
+    assert result.status == "warning"
+    assert any("Job 1 trace unavailable (HTTP 403)" in note for note in result.notes)
+    assert not any("Linked merge requests unavailable" in note for note in result.notes)
+
+
+@pytest.mark.parametrize("detail_kind", ["new_head", "missing_refs", "denied"])
+async def test_commit_linked_mr_still_requires_verified_pipeline_head_before_diffs(
+    gitlab, detail_kind,
+):
+    linked_mr(gitlab, head=HEAD if detail_kind == "new_head" else SHA)
+    primary = f"/projects/42/pipelines/{RUN_ID}/merge_requests"
+    gitlab.responses[f"/projects/42/repository/commits/{SHA}/merge_requests"] = (
+        gitlab.responses[primary]
+    )
+    gitlab.responses[primary] = 404
+    if detail_kind == "missing_refs":
+        gitlab.responses["/projects/42/merge_requests/7"].pop("diff_refs")
+    elif detail_kind == "denied":
+        gitlab.responses["/projects/42/merge_requests/7"] = 403
+
+    result = await gitlab.inspect()
+    assert gitlab.count("/projects/42/merge_requests/7") == 1
+    assert gitlab.count("/projects/42/merge_requests/7/diffs") == 0
+    assert gitlab.count(f"/projects/42/repository/commits/{SHA}/diff") == 1
+    assert result.merge_requests[0]["source_type"] == "pipeline_commit"
+    assert any("not historical evidence" in note for note in result.notes)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_failed_commit_mr_fallback_reports_actual_missing_evidence(gitlab, status):
+    gitlab.responses[f"/projects/42/pipelines/{RUN_ID}/merge_requests"] = 404
+    gitlab.responses[f"/projects/42/repository/commits/{SHA}/merge_requests"] = status
+    gitlab.set_jobs([job(1, "build", "success")])
+    result = await gitlab.inspect()
+    assert result.status == "warning" and result.analyzed_job_count == 1
+    assert result.merge_requests == []
+    assert gitlab.count(f"/projects/42/repository/commits/{SHA}/diff") == 1
+    assert any(f"Linked merge requests unavailable (HTTP {status})" in note
+               and "partial" in note for note in result.notes)
+    assert not any(item.severity == "error" for item in result.findings)
 
 
 @pytest.mark.parametrize("mixed_heads", [False, True])

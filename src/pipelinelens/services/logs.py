@@ -35,6 +35,14 @@ _PRIVATE_KEY_PATTERN = re.compile(
 _WARNING_PATTERN = re.compile(
     r"(?i)^(?:(?:INFO|DEBUG|TRACE)\s*:?\s*)?\[?warn(?:ing)?\]?\b|:\s*warning\b"
 )
+_EXAMPLE_PATTERN = re.compile(
+    r"(?i)^(?:(?:\[(?:INFO|DEBUG|TRACE)\]|INFO|DEBUG|TRACE)\s*:?\s*)?(?:"
+    r"#|//|```|~~~|(?:example|sample)(?:\s+(?:output|diagnostic|error))?\s*[:=]|"
+    r"for example\b|e\.g\.\s|"
+    r"(?:echo|printf|Write-Host|Write-Output)\s|"
+    r"(?:print|pprint|(?:logging|logger)\.\w+)\s*\(|"
+    r"[A-Za-z_]\w*\s*=\s*['\"])"
+)
 _BENIGN_PATTERN = re.compile(
     r"(?i)^(?:(?:\[(?:INFO|DEBUG|TRACE|ERROR)\]|INFO|DEBUG|TRACE|ERROR)\s*:?\s*)?(?:"
     r"(?:\d+\s+warning\(s\)\s*)?0\s+(?:error(?:\(s\)|s)?|failures?|failed)\b|"
@@ -57,6 +65,21 @@ _SUCCESS_PATTERN = re.compile(
 )
 _COMPONENT_FAILURE_PATTERN = re.compile(r"(?i)\bcomponent failures\s*\[\s*[1-9]\d*\s*\]")
 _TEST_FAILURE_SECTION_PATTERN = re.compile(r"(?i)\btest failures\s*\[\s*[1-9]\d*\s*\]")
+_VALIDATION_COUNT_PATTERN = re.compile(r"^Number of errors\s*-\s*(\d+)\s*$", re.I)
+_VALIDATION_HEADER_PATTERN = re.compile(r"^ComponentName\s+Type\s+ErrorMessage$", re.I)
+_TABLE_END_PATTERN = re.compile(
+    r"(?i)^(?:test results summary|test failures|deployment status|elapsed time|"
+    r"uploading artifacts|cleaning up|section_(?:start|end):|```|~~~)"
+)
+_MERGE_STATUS_PATTERN = re.compile(
+    r"^(?:ERROR:\s*)?Merge request status is (?:still )?(?P<status>[a-z_]+)\s*/\s*"
+    r"detailed merge request status is (?:still )?(?P<detail>[a-z_]+),\s*"
+    r"cannot (?:continue|proceed)\b", re.I,
+)
+_FAILED_UPLOAD_PATTERN = re.compile(
+    r"(?i)^Uploading artifacts for failed job\b|"
+    r"^section_start:\d+:upload_artifacts_on_failure\b"
+)
 DATASYNC_AMBIGUOUS_PATTERN = re.compile(
     r"^\s*\d+\s*\|\s*(?P<target>[^|]+?)\s*\|\s*FAIL\s*\|\s*AMBIGUOUS\b", re.IGNORECASE
 )
@@ -94,6 +117,10 @@ _COLON_LOCATION_SUFFIXES = (
 _COMPONENT_ROW_PATTERN = re.compile(
     r"^\s*(?P<metadata_type>[A-Za-z][A-Za-z0-9_]*)\s{2,}"
     r"(?P<component_name>\S+)\s{2,}(?P<problem>.+?)\s*$"
+)
+_VALIDATION_ROW_PATTERN = re.compile(
+    r'^"(?P<component_name>[^"\t]+)"\t+"(?P<metadata_type>[A-Za-z][A-Za-z0-9_]*)"'
+    r'\t+"(?P<problem>.+)"\s*$'
 )
 _LINE_COLUMN_PATTERN = re.compile(r"\b(?P<line>\d+):(?P<column>\d+)\b")
 
@@ -157,9 +184,30 @@ _RULES = (
         r"\bpreparation failed\b|\bjob failed \(system failure\)|"
         r"\bprepare environment:.*(?:error|failed|timeout|cannot)",
     ),
+    _rule(
+        "runner.image_pull_failed", "runner_infrastructure_failure", 99,
+        r"^ERROR:\s*Job failed:\s*failed to pull image\b",
+    ),
+    _rule(
+        "runner.job_timeout", "timeout", 99,
+        r"\bJob failed:\s*execution took longer than\s+\S+\s+seconds\b",
+    ),
+    _rule(
+        "artifact.upload_failed", "unknown", 20,
+        r"^(?:ERROR|FATAL):\s*(?:No files to upload\b|"
+        r"(?:uploading|failed to upload) artifacts\b)",
+    ),
     _rule("compiler.cs0161", "build_failure", 98, r"\berror\s+CS0161\s*:"),
     _rule("compiler.error", "build_failure", 97, r"\berror\s+(?:CS\d{4}|TS\d+|MSB\d+)\s*:"),
     _Rule("rlp.datasync_ambiguous", "deployment_failure", 96, DATASYNC_AMBIGUOUS_PATTERN),
+    _rule(
+        "salesforce.csv_as_sobject", "deployment_failure", 96,
+        r"\bInvalidJob\s*:\s*Unable to find object:\s*[A-Za-z_][\w]*\.csv\b",
+    ),
+    _rule(
+        "dependency.apt_release_expired", "dependency_failure", 96,
+        r"^E:\s*Release file for\s+\S+\s+is expired\b",
+    ),
     _rule(
         "rlp.flow_group_filter_rejected", "deployment_failure", 96,
         r"^(?=.*\bflow(?:s|group(?:id)?|filter)?\b)"
@@ -171,6 +219,11 @@ _RULES = (
     _rule(
         "rlp.datasync_failed", "deployment_failure", 94,
         r"\bdatasync\s+(?:run|target|validation|pre-validation)\s+(?:failed|failure)\b",
+    ),
+    _rule(
+        "git.merge_conflict", "merge_conflict", 94,
+        r"^VALIDATION FAILED\s*-\s*MERGE CONFLICT\b|"
+        r"^CONFLICT \([^)]+\):\s+\S|^Automatic merge failed;\s*fix conflicts\b",
     ),
     _Rule("salesforce.test_failure", "test_failure", 93, _TEST_FAILURE_SECTION_PATTERN, "test"),
     _rule(
@@ -196,6 +249,18 @@ _RULES = (
         r"^(?=.*\bsonar\.(?:projectKey|sources|tests|java\.binaries|projectBaseDir)\b)"
         r"(?=.*(?:must define|mandatory|missing|not found|does not exist|invalid|not defined|"
         r"please provide compiled)).+",
+    ),
+    _rule(
+        "salesforce.org_not_authenticated", "authentication_failure", 91,
+        r"^(?:(?:target-org|defaultusername|defaultdevhubusername)\s+.+?\s+false\s+|"
+        r"Error(?:\s*\([^)]*\))?:\s*)?"
+        r"Invalid config value:\s*org\s+[\"'][^\"']+[\"']\s+is not authenticated\b",
+    ),
+    _rule(
+        "script.exec_format", "script_execution_failure", 91,
+        r"^exec\s+\S+:\s*exec format error\s*$|"
+        r"^(?:\S*/)?(?:bash|sh|dash|zsh):\s*(?:line\s+\d+:\s*)?\S+:\s*"
+        r"cannot execute binary file:\s*Exec format error\s*$",
     ),
     _rule(
         "auth.authentication_rejected", "authentication_failure", 90,
@@ -226,9 +291,18 @@ _RULES = (
         r"could not find|required package)).+",
     ),
     _rule(
+        "script.invalid_json", "script_input_failure", 87,
+        r"^jq:\s*parse error:\s*(?:Invalid|Expected|Unfinished|Unmatched|Unterminated)\b",
+    ),
+    _rule(
         "compiler.build_failed", "build_failure", 85,
         r"\b(?:syntax error|compilation failed|compile error|cannot find symbol|"
         r"module not found|ModuleNotFoundError)\b|^Build FAILED\.?$",
+    ),
+    _rule(
+        "script.not_callable", "script_execution_failure", 85,
+        r"^(?:Uncaught\s+)?TypeError:\s*\S.*\bis not a function\b",
+        "stack_trace",
     ),
     _rule(
         "dependency.resolution_failed", "dependency_failure", 84,
@@ -239,6 +313,10 @@ _RULES = (
         "deployment.failed", "deployment_failure", 80,
         r"\b(?:deployment\s+status|status)\s*[\"']?\s*[:=]\s*[\"']?failed\b|"
         r"\bdeployment (?:step )?failed\b",
+    ),
+    _rule(
+        "salesforce.metadata_request_failed", "deployment_failure", 80,
+        r"^Error(?:\s*\([^)]*\))?:\s*Metadata API request failed:\s*\S",
     ),
     _rule(
         "http.service_failure", "external_api_failure", 78,
@@ -257,7 +335,8 @@ _RULES = (
     ),
     _rule(
         "log.explicit_error", "unknown", 50,
-        r"^(?:\[?ERROR\]?|FATAL)\s*[:| ]\s*\S|\b\w*(?:Error|Exception)\s*:",
+        r"^(?:\[?ERROR\]?|FATAL)\s*[:| ]\s*\S|"
+        r"^[\w.]*(?:Error|Exception)(?:\s*\([^)]*\))?\s*:",
     ),
     _rule(
         "script.nonzero_exit", "unknown", 15,
@@ -289,46 +368,172 @@ def iter_log_lines(content: str) -> Iterator[DiagnosticLine]:
         yield DiagnosticLine(text, index, index + 1 if known_offset else None)
 
 
+def _diagnostic_lines(content: str) -> Iterator[DiagnosticLine]:
+    """Retain boundaries but not fenced documentation presented inside a trace."""
+
+    fence: str | None = None
+    for item in iter_log_lines(content):
+        if _OMISSION_PATTERN.search(item.text):
+            fence = None
+        if item.text.startswith(("```", "~~~")):
+            marker = item.text[:3]
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+            yield item
+        elif fence is None:
+            yield item
+
+
+def _diagnostic_noise(line: str) -> bool:
+    return bool(
+        not line or _COMMAND_PATTERN.match(line) or _WARNING_PATTERN.search(line)
+        or _BENIGN_PATTERN.search(line) or _EXAMPLE_PATTERN.search(line)
+        or _OMISSION_PATTERN.search(line)
+    )
+
+
+def _ends_upload_context(line: str) -> bool:
+    return bool(
+        _OMISSION_PATTERN.search(line) or _COMMAND_PATTERN.match(line)
+        or line.lower().startswith(("cleaning up", "section_end:", "section_start:"))
+    )
+
+
+def parse_component_failure(line: str) -> DeploymentComponentFailure | None:
+    """Parse a CLI row's fields; the caller must separately establish a failure table."""
+
+    match = _VALIDATION_ROW_PATTERN.fullmatch(line) or _COMPONENT_ROW_PATTERN.fullmatch(line)
+    if match is None or match["metadata_type"].lower() == "type":
+        return None
+    problem = match["problem"]
+    location = _LINE_COLUMN_PATTERN.search(problem)
+    return DeploymentComponentFailure(
+        metadata_type=match["metadata_type"], component_name=match["component_name"],
+        problem=problem,
+        line=int(location["line"]) if location else None,
+        column=int(location["column"]) if location else None,
+    )
+
+
+def _metadata_rule(component: DeploymentComponentFailure) -> str:
+    problem = component.problem
+    if component.metadata_type in {"ApexClass", "ApexTrigger"} and re.search(
+        r"(?i)method does not exist or incorrect signature|variable does not exist|"
+        r"dependent class is invalid and needs recompilation|no such column|invalid type:",
+        problem,
+    ):
+        return "salesforce.apex_compile"
+    if re.search(r"(?i)error parsing file:|\b(?:XML|meta XML) parse error:|ParseError at", problem):
+        return "salesforce.metadata_parse"
+    if re.match(r"(?i)duplicate (?:name|property)\b", problem):
+        return "salesforce.metadata_duplicate"
+    if re.search(
+        r"(?i)referenced by|dependent metadata|no .*named .*found|"
+        r"invalid (?:type|reference)|does not exist|not found", problem,
+    ):
+        return "salesforce.metadata_dependency"
+    return "salesforce.metadata_error"
+
+
+def _metadata_diagnostics(
+    content: str,
+) -> Iterator[tuple[FailureSignal, DeploymentComponentFailure | None]]:
+    """Accept standard CLI tables or count + header + quoted TSV validation reports.
+
+    An arbitrary inline row, a zero count, or a header across a command/omission is
+    not evidence. Table state never extends into upload/cleanup or another section.
+    """
+
+    table: Literal["standard", "validation"] | None = None
+    pending: DiagnosticLine | None = None
+    seen_row = False
+    for item in _diagnostic_lines(content):
+        line = item.text
+        if (_TABLE_END_PATTERN.search(line) or _COMMAND_PATTERN.match(line)
+                or _OMISSION_PATTERN.search(line) or (not line and seen_row)):
+            table, pending, seen_row = None, None, False
+        if re.fullmatch(r"(?i)component failures\s*\[\s*0\s*\]", line):
+            table, pending, seen_row = None, None, False
+        if _diagnostic_noise(line):
+            continue
+        if line.lower().startswith("component failures"):
+            table, pending, seen_row = None, None, False
+            if _COMPONENT_FAILURE_PATTERN.search(line):
+                table = "standard"
+                yield FailureSignal(
+                    "salesforce.component_failure", "deployment_failure", line,
+                    item.index, item.line, 95,
+                ), None
+            continue
+        if match := _VALIDATION_COUNT_PATTERN.fullmatch(line):
+            table, seen_row = None, False
+            pending = item if match[1].lstrip("0") else None
+            continue
+        if pending and item.index - pending.index > 6:
+            pending = None
+        if _VALIDATION_HEADER_PATTERN.fullmatch(line):
+            if pending:
+                table = "validation"
+                yield FailureSignal(
+                    "salesforce.validation_failed", "deployment_failure", pending.text,
+                    pending.index, pending.line, 95,
+                ), None
+            pending = None
+            continue
+        pattern = _VALIDATION_ROW_PATTERN if table == "validation" else _COMPONENT_ROW_PATTERN
+        if table and pattern.fullmatch(line) and (component := parse_component_failure(line)):
+            seen_row = True
+            yield FailureSignal(
+                _metadata_rule(component), "deployment_failure", line,
+                item.index, item.line, 96,
+            ), component
+
+
 def failure_signals(content: str) -> list[FailureSignal]:
     """Rank explicit causal diagnostics; ties prefer the earliest diagnostic, not the footer."""
 
     signals: list[FailureSignal] = []
-    in_component_table = False
-    for item in iter_log_lines(content):
+    metadata = {signal.index: signal for signal, _ in _metadata_diagnostics(content)}
+    failed_upload = False
+    for item in _diagnostic_lines(content):
         line = item.text
-        if _COMPONENT_FAILURE_PATTERN.search(line):
-            in_component_table = True
-        elif line.lower().startswith(("test results summary", "test failures")):
-            in_component_table = False
-        if not line or _COMMAND_PATTERN.match(line) or _WARNING_PATTERN.search(line):
-            continue
-        if _BENIGN_PATTERN.search(line) or _OMISSION_PATTERN.search(line):
-            if _OMISSION_PATTERN.search(line):
-                in_component_table = False
+        if _FAILED_UPLOAD_PATTERN.search(line):
+            failed_upload = True
+        elif _ends_upload_context(line):
+            failed_upload = False
+        if _diagnostic_noise(line):
             continue
         if _GENERIC_FOOTER_PATTERN.fullmatch(line):
             signals.append(FailureSignal(
                 "script.nonzero_exit", "unknown", line, item.index, item.line, 15,
             ))
             continue
-        if in_component_table and (row := _COMPONENT_ROW_PATTERN.match(line)):
-            if row.group("metadata_type").lower() != "type":
-                dependency = re.search(
-                    r"(?i)referenced by|dependent metadata|no .*named .*found|"
-                    r"invalid (?:type|reference)|does not exist|not found",
-                    row.group("problem"),
-                )
-                signals.append(FailureSignal(
-                    "salesforce.metadata_dependency" if dependency else "salesforce.metadata_error",
-                    "deployment_failure", line, item.index, item.line, 96,
-                ))
-                continue
+        if item.index in metadata and not failed_upload:
+            signals.append(metadata[item.index])
+            continue
+        if not failed_upload and (match := _MERGE_STATUS_PATTERN.match(line)):
+            detail = match["detail"].lower()
+            rule_id = {
+                "conflict": "git.merge_conflict", "not_approved": "git.merge_approval_required",
+            }.get(detail, "git.merge_status_unresolved")
+            signals.append(FailureSignal(
+                rule_id, "merge_conflict" if detail == "conflict" else "merge_blocked",
+                line, item.index, item.line, 94,
+            ))
+            continue
         for rule in _RULES:
             if rule.pattern.search(line):
-                signals.append(FailureSignal(
+                signal = FailureSignal(
                     rule.rule_id, rule.category, line, item.index, item.line,
                     rule.priority, rule.chunk_type,
-                ))
+                )
+                if failed_upload and not rule.rule_id.startswith("runner."):
+                    signal = FailureSignal(
+                        "artifact.upload_failed", "unknown", line, item.index, item.line, 20,
+                    )
+                signals.append(signal)
                 break
     return sorted(signals, key=lambda signal: (-signal.priority, signal.index))
 
@@ -359,6 +564,18 @@ def chunk_log(content: str, context_before: int = 3, context_after: int = 7) -> 
     diagnostic_lines = list(iter_log_lines(content))
     signals = failure_signals(content)
     signals_by_index = {signal.index: signal for signal in signals}
+    unfenced: set[int] = set()
+    upload_context: set[int] = set()
+    uploading = False
+    for item in _diagnostic_lines(content):
+        if not item.text.startswith(("```", "~~~")):
+            unfenced.add(item.index)
+        if _FAILED_UPLOAD_PATTERN.search(item.text):
+            uploading = True
+        elif _ends_upload_context(item.text):
+            uploading = False
+        if uploading:
+            upload_context.add(item.index)
     windows = [
         (max(0, signal.index - context_before), min(len(lines) - 1, signal.index + context_after))
         for signal in signals
@@ -371,7 +588,17 @@ def chunk_log(content: str, context_before: int = 3, context_after: int = 7) -> 
     bounded_windows: list[tuple[int, int]] = []
     for start, stop in merged_windows:
         while start <= stop:
-            end = min(stop, start + 79)
+            # A closing fence without its opening fence reverses the interpretation
+            # of a standalone excerpt. Trim that non-diagnostic prefix instead.
+            if signals:
+                while start <= stop and start not in unfenced:
+                    start += 1
+                if start > stop:
+                    break
+            anchored_upload = start in upload_context and not _FAILED_UPLOAD_PATTERN.search(
+                diagnostic_lines[start].text
+            )
+            end = min(stop, start + (77 if anchored_upload else 79))
             for offset in range(start + 1, end + 1):
                 if (diagnostic_lines[offset].line is None) != (
                     diagnostic_lines[start].line is None
@@ -382,6 +609,17 @@ def chunk_log(content: str, context_before: int = 3, context_after: int = 7) -> 
             start = end + 1
     for start, end in bounded_windows:
         selected_lines = lines[start : end + 1]
+        anchored_upload = start in upload_context and not _FAILED_UPLOAD_PATTERN.search(
+            diagnostic_lines[start].text
+        )
+        if anchored_upload:
+            # Preserve a known earlier phase when the legacy adapter re-parses a
+            # standalone chunk. The synthetic context must not fabricate citations.
+            selected_lines = [
+                "[PIPELINELENS_LOG_OMITTED: earlier upload context]",
+                "Uploading artifacts for failed job [context from earlier in trace]",
+                *selected_lines,
+            ]
         best = max(
             (signals_by_index[index] for index in range(start, end + 1)
              if index in signals_by_index),
@@ -390,7 +628,8 @@ def chunk_log(content: str, context_before: int = 3, context_after: int = 7) -> 
         chunk_id = hashlib.sha256(f"{start}:{end}:{'|'.join(selected_lines)}".encode()).hexdigest()[
             :16
         ]
-        prefix = "log-" if diagnostic_lines[start].line is not None else "log-retained-"
+        prefix = "log-" if diagnostic_lines[start].line is not None and not anchored_upload \
+            else "log-retained-"
         chunks.append(
             LogChunk(
                 chunk_id=f"{prefix}{chunk_id}",
@@ -488,39 +727,15 @@ def extract_deployment_component_failures(
     content: str,
     limit: int = 10,
 ) -> list[DeploymentComponentFailure]:
-    """Extract Salesforce metadata deployment failures from CLI component-failure tables."""
+    """Extract only rows corroborated by a nonzero Salesforce failure-table header."""
 
     if limit <= 0:
         return []
     failures: list[DeploymentComponentFailure] = []
-    in_component_table = False
-    for item in iter_log_lines(content):
-        line = item.text
-        if _COMPONENT_FAILURE_PATTERN.search(line):
-            in_component_table = True
+    for _, component in _metadata_diagnostics(content):
+        if component is None:
             continue
-        if not in_component_table:
-            continue
-        if not line or line.lower().startswith("test results summary"):
-            if failures or line.lower().startswith("test results summary"):
-                break
-            continue
-        if line.lower().startswith("type") or set(line) == {"-"}:
-            continue
-        match = _COMPONENT_ROW_PATTERN.match(line)
-        if match is None:
-            continue
-        problem = match.group("problem")
-        location = _LINE_COLUMN_PATTERN.search(problem)
-        failures.append(
-            DeploymentComponentFailure(
-                metadata_type=match.group("metadata_type"),
-                component_name=match.group("component_name"),
-                problem=problem,
-                line=int(location.group("line")) if location else None,
-                column=int(location.group("column")) if location else None,
-            )
-        )
+        failures.append(component)
         if len(failures) >= limit:
             break
     return failures

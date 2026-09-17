@@ -16,6 +16,13 @@ htmlcov/
 gitlab-token.exe
 *.pem
 *.key
+*.p12
+*.pfx
+credentials/
+
+# Salesforce CLI local org state (org IDs, metadata catalogs, auth pointers)
+.sf/
+.sfdx/
 
 # Local PipelineLens data
 .pipelinelens/

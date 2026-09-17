@@ -653,6 +653,89 @@ class GitLabProvider(ReadOnlyHttpProvider, CiProvider):
         )
         return response.text
 
+    async def fetch_job_artifact_archive(
+        self,
+        token: str,
+        repository: RepositoryRef,
+        job_id: str,
+        max_bytes: int = 2 * 1024 * 1024,
+    ) -> bytes:
+        """Fetch one job artifact ZIP through the existing same-origin GET guard."""
+
+        if (
+            type(max_bytes) is not int
+            or not 0 < max_bytes <= 2 * 1024 * 1024
+            or not isinstance(job_id, str)
+            or re.fullmatch(r"[1-9][0-9]{0,19}", job_id) is None
+        ):
+            raise ProviderError(
+                self.provider_name, 400, "Invalid job artifact request limit or ID."
+            )
+        path = f"/projects/{self._project_path(repository)}/jobs/{job_id}/artifacts"
+        headers = self._headers(token)
+        headers["Accept"] = "application/zip"
+        headers["Accept-Encoding"] = "identity"
+
+        async def read_archive(client: httpx.AsyncClient) -> bytes:
+            async with client.stream("GET", path, headers=headers) as response:
+                if response.is_redirect:
+                    raise ProviderError(
+                        self.provider_name,
+                        response.status_code,
+                        "GitLab redirects are not followed; configure the canonical HTTPS "
+                        "server origin.",
+                    )
+                if response.is_error:
+                    raise ProviderError(
+                        self.provider_name,
+                        response.status_code,
+                        self._safe_error_message(response),
+                    )
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    if not content_length.isdecimal():
+                        raise ProviderError(
+                            self.provider_name,
+                            502,
+                            "GitLab returned an invalid job artifact archive.",
+                        )
+                    if int(content_length) > max_bytes:
+                        raise ProviderError(
+                            self.provider_name,
+                            413,
+                            "GitLab job artifact archive exceeds the safety limit.",
+                        )
+                if response.is_stream_consumed:
+                    archive = response.content
+                    if len(archive) > max_bytes:
+                        raise ProviderError(
+                            self.provider_name,
+                            413,
+                            "GitLab job artifact archive exceeds the safety limit.",
+                        )
+                    return archive
+                archive = bytearray()
+                async for chunk in response.aiter_raw(chunk_size=64 * 1024):
+                    if len(archive) + len(chunk) > max_bytes:
+                        raise ProviderError(
+                            self.provider_name,
+                            413,
+                            "GitLab job artifact archive exceeds the safety limit.",
+                        )
+                    archive.extend(chunk)
+                return bytes(archive)
+
+        async with self._request_semaphore:
+            try:
+                if self._shared_client is not None:
+                    return await read_archive(self._shared_client)
+                async with self._new_client() as client:
+                    return await read_archive(client)
+            except httpx.HTTPError:
+                raise ProviderError(
+                    self.provider_name, 502, "The GitLab read-only request could not be completed."
+                ) from None
+
     async def fetch_file_at_ref(
         self, token: str, repository: RepositoryRef, path: str, ref: str
     ) -> CiConfigFile:
