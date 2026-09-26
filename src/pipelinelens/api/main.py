@@ -239,7 +239,7 @@ def create_app(settings: Settings | None = None, store: IncidentStore | None = N
     app.state.credential_vault = CredentialVault()
     app.state.local_knowledge = LocalKnowledgeCache()
     app.include_router(create_inspection_router(
-        settings, app.state.credential_vault, app.state.local_knowledge,
+        settings, app.state.credential_vault, app.state.local_knowledge, store,
     ))
 
     @app.exception_handler(RequestValidationError)

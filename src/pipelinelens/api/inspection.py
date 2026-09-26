@@ -26,6 +26,7 @@ from pipelinelens.config import Settings
 from pipelinelens.providers.base import ProviderError
 from pipelinelens.providers.gitlab import GitLabProvider
 from pipelinelens.services.agent import AgentInvestigation, agent_configured, investigate
+from pipelinelens.services.agent_memory import build_history
 from pipelinelens.services.cloud_assist import (
     CloudAssistResult,
     resolve_cloud_assist_provider,
@@ -38,6 +39,7 @@ from pipelinelens.services.pipeline_url import GitLabReference, _origin, parse_g
 from pipelinelens.services.redaction import redact_text
 from pipelinelens.services.remediation import Remediation
 from pipelinelens.services.repair_context import enrich_remediations, source_reader
+from pipelinelens.storage import IncidentStore
 
 
 class InspectionRequest(BaseModel):
@@ -188,6 +190,7 @@ def create_inspection_router(
     settings: Settings,
     vault: CredentialVault,
     knowledge: LocalKnowledgeCache,
+    store: IncidentStore | None = None,
 ) -> APIRouter:
     cache = _ResultCache()
     corpus = PipelineCorpus(knowledge.directory.parent / "corpus", settings=settings)
@@ -317,6 +320,7 @@ def create_inspection_router(
             is not None,
             "cloud_assist_provider": provider.name if provider else None,
             "agent_configured": agent_configured(settings),
+            "agent_auto": bool(settings.agent_auto and agent_configured(settings)),
         }
 
     @router.post("/inspect", response_model=InspectionResponse)
@@ -468,7 +472,8 @@ def create_inspection_router(
                                     "unaffected."
                                 )
                     agent_result: AgentInvestigation | None = None
-                    if request.ask_agent and agent_configured(settings) and primary is not None:
+                    wants_agent = request.ask_agent or settings.agent_auto
+                    if wants_agent and agent_configured(settings) and primary is not None:
                         plan = next((item for item in remediations
                                      if item.rule_id == primary.rule_id
                                      and item.job_id == primary.job_id), None)
@@ -476,12 +481,19 @@ def create_inspection_router(
                         if primary.confidence == "unknown" or plan is None or not plan.proposals:
                             agent_notes: list[str] = []
                             try:
+                                history = await asyncio.to_thread(
+                                    build_history, result.project_key, primary,
+                                    snapshot=next((item for item in result.analyses
+                                                   if item.job.external_id == primary.job_id),
+                                                  None),
+                                    knowledge=knowledge, corpus=corpus, store=store,
+                                )
                                 agent_result = await asyncio.wait_for(investigate(
                                     settings, result, primary, plan,
                                     read_source=source_reader(
                                         provider, candidate.token, settings, result,
                                     ),
-                                    notes=agent_notes,
+                                    history=history, notes=agent_notes,
                                 ), timeout=180)
                             except TimeoutError:
                                 agent_notes.append("The investigation agent timed out.")

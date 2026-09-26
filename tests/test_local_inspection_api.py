@@ -1220,8 +1220,8 @@ def test_ask_agent_on_an_unresolved_finding_returns_a_separate_investigation(
 ) -> None:
     calls = []
 
-    async def fake_investigate(settings, result, finding, plan, *, read_source, notes):
-        calls.append((finding.rule_id, plan, read_source is not None))
+    async def fake_investigate(settings, result, finding, plan, *, read_source, history, notes):
+        calls.append((finding.rule_id, plan, read_source is not None, history))
         return _canned_investigation()
 
     monkeypatch.setattr(inspection_api, "inspect_gitlab", _unknown_finding_inspect_factory())
@@ -1237,11 +1237,13 @@ def test_ask_agent_on_an_unresolved_finding_returns_a_separate_investigation(
     assert body["findings"][0]["confidence"] == "unknown"  # Deterministic verdict unchanged.
     assert len(calls) == 1 and calls[0][0] == "job.insufficient_evidence"
     assert calls[0][2] is True  # A pinned-SHA source reader was provided.
+    assert calls[0][3].rule_id == "job.insufficient_evidence"  # Local history was built.
     _assert_no_secrets(response.text)
 
 
 def test_agent_failure_adds_a_note_and_keeps_the_local_result(local_api, monkeypatch) -> None:
-    async def failing_investigate(settings, result, finding, plan, *, read_source, notes):
+    async def failing_investigate(settings, result, finding, plan, *, read_source, history,
+                                  notes):
         notes.append("The investigation agent stopped: synthetic failure.")
         return None
 
@@ -1268,3 +1270,26 @@ def test_ask_agent_unconfigured_makes_no_call(local_api, monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["agent_investigation"] is None
+
+
+def test_agent_auto_setting_investigates_without_the_request_flag(local_api, monkeypatch) -> None:
+    calls = []
+
+    async def fake_investigate(settings, result, finding, plan, *, read_source, history, notes):
+        calls.append(finding.rule_id)
+        return _canned_investigation()
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", _unknown_finding_inspect_factory())
+    monkeypatch.setattr(inspection_api, "agent_configured", lambda settings: True)
+    monkeypatch.setattr(inspection_api, "investigate", fake_investigate)
+    auto = replace(local_api.settings, agent_auto=True)
+    with TestClient(_app(auto, local_api.vault, local_api.knowledge)) as client:
+        response = client.post(_PREFIX + "/inspect", headers=_LOCAL, json={
+            "url": _PIPELINE_URL, "token": _REQUEST,
+        })
+        status = client.get(_PREFIX + "/status", headers=_LOCAL).json()
+
+    assert status["agent_auto"] is True
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_investigation"]["model"] == "fake-agent"
+    assert calls == ["job.insufficient_evidence"]

@@ -38,6 +38,7 @@ class Settings:
     agent_model: str = ""
     agent_api_key: str | None = field(default=None, repr=False)
     agent_max_turns: int = 8
+    agent_auto: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -64,4 +65,5 @@ def get_settings() -> Settings:
         agent_model=os.getenv("PIPELINELENS_AGENT_MODEL", "").strip(),
         agent_api_key=os.getenv("PIPELINELENS_AGENT_API_KEY") or None,
         agent_max_turns=max(1, min(20, int(os.getenv("PIPELINELENS_AGENT_MAX_TURNS", "8")))),
+        agent_auto=_as_bool(os.getenv("PIPELINELENS_AGENT_AUTO")),
     )

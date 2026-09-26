@@ -408,6 +408,7 @@ from one snippet. The agent runs a bounded tool-calling loop with read-only tool
 | `list_changed_files`, `list_repository_files` | Change list and repository tree |
 | `read_source` | A known repository file at the failed pipeline SHA (limited reads) |
 | `get_skill_pack` | The matching skill pack, including its `investigate:` steps |
+| `search_history` | This project's local history (RAG): confirmed fixes, past failures, past incidents |
 
 There is no tool that writes, reruns, approves, deploys or changes credentials. What the code
 enforces, independent of the prompt:
@@ -437,6 +438,30 @@ PIPELINELENS_AGENT_MODEL=qwen2.5-coder:14b
 Then check **Let an agent investigate if no verified fix is found** under **Connection &
 options**. The result appears in its own "Agent investigation" panel with its citations, tool
 trail, and any verified patch.
+
+### Local history (RAG) and the learning loop
+
+`search_history` gives the agent retrieval over three local stores PipelineLens already keeps,
+scoped to the inspected project. It adds no new data collection:
+
+1. **Human-confirmed resolutions** for this project and rule (from **Confirm a tested
+   resolution**). These always rank first.
+2. **Past failed jobs** in the local pipeline corpus (`make pipeline-corpus-ingest`), ranked
+   by lexical similarity of their sanitized error excerpts to the current failure.
+3. **Past incidents** saved by the RAG analysis path (`IncidentStore`), with any confirmed
+   resolution.
+
+History is loaded once, bounded, before the agent starts, and ranked deterministically. Each
+hit is an evidence id the agent can cite, like `history:resolution:…` or `history:job:…`. The
+task prompt tells the agent how much history exists.
+
+The loop closes in the dashboard. When the agent answers, the **Confirm a tested resolution**
+form is pre-filled with its root cause and patch. Once you have tested the fix and confirmed
+it, the next investigation of the same rule in that project finds it first. Nothing is
+learned automatically: only explicit human confirmations count as fixes.
+
+To have the agent run whenever the rules have no verified fix, without ticking the box each
+time, set `PIPELINELENS_AGENT_AUTO=true`.
 
 ### Editing what the model is told
 

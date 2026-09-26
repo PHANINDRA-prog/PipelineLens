@@ -1739,3 +1739,19 @@ def test_agent_option_is_sent_only_when_configured_and_its_answer_renders(ui):
     assert "Agent cause confidence 70/100 · fix confidence 50/100 (capped; not calibrated)" in (
         captions)
     assert any("--- a/src/calc.py" in block.value for block in at.code)
+
+
+def test_agent_answer_prefills_the_confirmation_form_for_its_rule(ui):
+    at, api = ui
+    rule = next(item["rule_id"] for item in api.result["findings"]
+                if item.get("severity") in {"error", "warning"})
+    api.result = {**api.result, "agent_investigation": {
+        "model": "local-agent", "rule_id": rule, "summary": "s",
+        "likely_root_cause": "The deploy script targets a removed host.",
+        "cause_confidence": 60, "fix_confidence": 20, "evidence": [],
+        "patch": {"path": "deploy.sh", "diff": "d"}, "notice": "n",
+    }}
+    submit(at)
+    assert not at.exception
+    drafts = [area.value for area in at.text_area if area.key.startswith("resolution-text-")]
+    assert drafts == ["The deploy script targets a removed host.\nFix: agent patch to deploy.sh."]

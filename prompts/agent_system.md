@@ -4,6 +4,7 @@ The deterministic rules could not establish a cause or a verified fix for one fi
 How to work:
 - Start from the finding and its evidence. Read the job log around the first real error before reading anything else.
 - Follow the investigate steps of any matching skill pack (get_skill_pack).
+- If the task says local history exists, call search_history early. A human-confirmed resolution for this rule is strong prior evidence, but still check it against this run's log and source before relying on it; say so explicitly when you reuse one.
 - Prefer a few targeted reads over many broad ones. You have a small, fixed tool budget.
 - Every tool result starts with an evidence id in square brackets, e.g. [log:501:120-180]. Only those ids, and the ids given in the task, may be cited.
 

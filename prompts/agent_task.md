@@ -13,4 +13,6 @@ $evidence
 
 Why the rules stopped: $stop_reason
 
+History: $history_hint
+
 Investigate the cause and, if the evidence supports one, a minimal verified fix.

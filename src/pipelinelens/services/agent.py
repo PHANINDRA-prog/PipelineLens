@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from pipelinelens.config import Settings
 from pipelinelens.domain import AnalysisSnapshot, CiConfigFile
+from pipelinelens.services.agent_memory import AgentHistory
 from pipelinelens.services.findings import Finding
 from pipelinelens.services.inspection import InspectionResult
 from pipelinelens.services.prompts import PromptError, load_prompt
@@ -217,6 +218,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
           {"path": {"type": "string"}, "start_line": _INT, "end_line": _INT}, ("path",)),
     _tool("get_skill_pack", "Curated runbook, safe actions and investigation steps for a "
           "failure category.", {"category": {"type": "string"}}, ("category",)),
+    _tool("search_history", "Search this project's local history: human-confirmed fixes "
+          "for this rule (always first), similar past failed jobs, and past incidents. "
+          "Optional query text narrows similarity ranking.", {"query": {"type": "string"}}),
 ]
 
 
@@ -233,6 +237,7 @@ class _Toolbox:
     result: InspectionResult
     read_source_at_sha: SourceReader | None
     limits: AgentLimits
+    history: AgentHistory | None = None
     evidence: dict[str, str] = field(default_factory=dict)
     sources: dict[str, CiConfigFile] = field(default_factory=dict)
     source_reads: int = 0
@@ -344,6 +349,21 @@ class _Toolbox:
                 "Runbook:\n" + pack.runbook[:2_500],
             ])
             return self.issue(pack.evidence_id, f"Skill pack {pack.title}"), body
+        if name == "search_history":
+            if self.history is None or not self.history.items:
+                return self.issue("history:none", "No local history"), "No local history."
+            hits = self.history.search(str(args.get("query") or ""))
+            if not hits:
+                return self.issue("history:none", "No local history"), "No similar history."
+            blocks = []
+            for score, hit in hits:
+                self.issue(hit.evidence_id, hit.kind.replace("_", " "))
+                label = "confirmed" if hit.kind == "confirmed_resolution" else f"score {score}"
+                blocks.append(f"[{hit.evidence_id}] ({hit.kind}, {label})\n{hit.text[:1_200]}")
+            evidence_id = self.issue(
+                f"history:search:{_short_hash(str(args.get('query') or ''))}", "History search",
+            )
+            return evidence_id, "\n\n".join(blocks)
         raise AgentError("Unknown tool.")
 
     async def _read_source(self, args: dict[str, Any]) -> tuple[str, str]:
@@ -472,7 +492,8 @@ def _clip(value: str) -> str:
 
 
 def _task_values(result: InspectionResult, finding: Finding,
-                 remediation: Remediation | None) -> dict[str, str]:
+                 remediation: Remediation | None,
+                 history: AgentHistory | None = None) -> dict[str, str]:
     evidence = "\n".join(
         f"- {'line ' + str(item.line) + ': ' if item.line else ''}"
         f"{'(' + item.path + ') ' if item.path else ''}{redact_text(item.text)[:800]}"
@@ -497,6 +518,7 @@ def _task_values(result: InspectionResult, finding: Finding,
         "rule_id": finding.rule_id, "category": finding.category,
         "title": redact_text(finding.title), "explanation": redact_text(finding.explanation),
         "confidence": finding.confidence, "evidence": evidence, "stop_reason": _clip(stop),
+        "history_hint": history.hint() if history else "No local history is available.",
     }
 
 
@@ -584,6 +606,7 @@ async def investigate(
     remediation: Remediation | None = None,
     *,
     read_source: SourceReader | None = None,
+    history: AgentHistory | None = None,
     client: AgentChatClient | None = None,
     limits: AgentLimits | None = None,
     notes: list[str] | None = None,
@@ -600,13 +623,13 @@ async def investigate(
             client = OpenAICompatibleAgentClient(settings)
         system_prompt = load_prompt("agent_system")
         task_prompt = load_prompt("agent_task")
-        toolbox = _Toolbox(result, read_source, active_limits)
+        toolbox = _Toolbox(result, read_source, active_limits, history)
         toolbox.issue(f"finding:{finding.rule_id}", f"Rule finding {finding.rule_id}")
         loop = _Loop(client, toolbox, active_limits)
         answer = await loop.run([
             {"role": "system", "content": system_prompt.render()},
             {"role": "user", "content": task_prompt.render(
-                **_task_values(result, finding, remediation))},
+                **_task_values(result, finding, remediation, history))},
         ])
         patch: AgentPatch | None = None
         rejected: str | None = None

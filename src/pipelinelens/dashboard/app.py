@@ -493,6 +493,8 @@ def _render_input(status: dict[str, Any]) -> None:
                     "what it read and is shown separately from the rule-based diagnosis."
                 ),
             )
+            if status.get("agent_auto"):
+                st.caption("The agent is set to run automatically (PIPELINELENS_AGENT_AUTO) whenever the rules find no verified fix.")
     # The disclosure stays visible even when the connection options are closed.
     st.caption(LOCAL_NOTES_NOTICE if st.session_state.remember_analysis else "Diagnostic note saving is off for the next analysis; existing notes stay on this device.")
     if submitted:
@@ -1150,6 +1152,16 @@ def _render_confirmation(result: dict[str, Any], findings: list[dict[str, Any]])
     with st.expander("Confirm a tested resolution", expanded=False):
         st.caption("Nothing is auto-confirmed. Record only a change you actually tested for this project and finding; do not paste credentials.")
         key = _result_key(result)
+        agent = result.get("agent_investigation")
+        if isinstance(agent, dict) and agent.get("rule_id") in rules:
+            # Pre-fill from the agent so a tested fix becomes local history for next time.
+            patch = agent.get("patch") if isinstance(agent.get("patch"), dict) else {}
+            draft = _brief(agent.get("likely_root_cause") or agent.get("summary") or "", 1500)
+            if patch.get("path"):
+                draft += f"\nFix: agent patch to {_brief(patch['path'], 200)}."
+            st.session_state.setdefault(f"resolution-rule-{key}", agent["rule_id"])
+            st.session_state.setdefault(f"resolution-text-{key}", draft)
+            st.caption("Pre-filled from the agent investigation. Edit it to say what you actually tested. Once confirmed, the agent sees it as history for this project and rule.")
         with st.form(f"confirm-{key}", clear_on_submit=False):
             rule = st.selectbox("Finding to confirm", list(rules), format_func=lambda value: f"{value} · {rules[value].get('title', '')}", key=f"resolution-rule-{key}")
             resolution = st.text_area("What change was tested and resolved the issue?", max_chars=4000, key=f"resolution-text-{key}")
