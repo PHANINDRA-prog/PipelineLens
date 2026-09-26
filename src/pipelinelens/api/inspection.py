@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator
 from pipelinelens.config import Settings
 from pipelinelens.providers.base import ProviderError
 from pipelinelens.providers.gitlab import GitLabProvider
+from pipelinelens.services.agent import AgentInvestigation, agent_configured, investigate
 from pipelinelens.services.cloud_assist import (
     CloudAssistResult,
     resolve_cloud_assist_provider,
@@ -36,7 +37,7 @@ from pipelinelens.services.pipeline_corpus import CorpusError, PipelineCorpus
 from pipelinelens.services.pipeline_url import GitLabReference, _origin, parse_gitlab_url
 from pipelinelens.services.redaction import redact_text
 from pipelinelens.services.remediation import Remediation
-from pipelinelens.services.repair_context import enrich_remediations
+from pipelinelens.services.repair_context import enrich_remediations, source_reader
 
 
 class InspectionRequest(BaseModel):
@@ -48,6 +49,7 @@ class InspectionRequest(BaseModel):
     refresh: bool = False
     max_jobs: int = Field(default=5, ge=1, le=8)
     ask_cloud_ai: bool = False
+    ask_agent: bool = False
 
     @field_validator("token")
     @classmethod
@@ -75,6 +77,7 @@ class InspectionResponse(InspectionResult):
     corpus_matches: dict[str, dict[str, int]] = Field(default_factory=dict)
     retention_notice: str = "Redacted diagnostic notes stay on this device when enabled."
     cloud_assist: CloudAssistResult | None = None
+    agent_investigation: AgentInvestigation | None = None
     mode: Literal["local_rules"] = "local_rules"
 
 
@@ -313,6 +316,7 @@ def create_inspection_router(
             "cloud_assist_configured": (provider := resolve_cloud_assist_provider(settings))
             is not None,
             "cloud_assist_provider": provider.name if provider else None,
+            "agent_configured": agent_configured(settings),
         }
 
     @router.post("/inspect", response_model=InspectionResponse)
@@ -394,6 +398,7 @@ def create_inspection_router(
                         result.notes.append(str(error) + " The inspection result is still usable.")
                     secrets = tuple(value for value in (
                         candidate.token, settings.configured_gitlab_token, settings.llm_api_key,
+                        settings.agent_api_key,
                     ) if value)
                     summary = {}
                     confirmed = []
@@ -437,18 +442,18 @@ def create_inspection_router(
                             "Local corpus coverage is unavailable; diagnostic scores "
                             "do not depend on historical frequency.",
                         )
+                    context_categories = {
+                        "pipeline_status", "job_status", "ci_configuration", "ci_visibility",
+                        "no_failure_observed", "downstream_pipeline",
+                    }
+                    primary = next((finding for finding in root_findings if (
+                        finding.severity in {"error", "warning"}
+                        and finding.category not in context_categories
+                        and not finding.rule_id.startswith(("pipeline.", "ci.visibility"))
+                    )), None)
                     cloud_assist: CloudAssistResult | None = None
                     cloud_provider = resolve_cloud_assist_provider(settings)
                     if request.ask_cloud_ai and cloud_provider is not None:
-                        context_categories = {
-                            "pipeline_status", "job_status", "ci_configuration", "ci_visibility",
-                            "no_failure_observed", "downstream_pipeline",
-                        }
-                        primary = next((finding for finding in root_findings if (
-                            finding.severity in {"error", "warning"}
-                            and finding.category not in context_categories
-                            and not finding.rule_id.startswith(("pipeline.", "ci.visibility"))
-                        )), None)
                         if primary is not None and primary.confidence == "unknown":
                             try:
                                 cloud_assist = await asyncio.wait_for(
@@ -462,6 +467,28 @@ def create_inspection_router(
                                     "returned nothing usable; the local diagnosis above is "
                                     "unaffected."
                                 )
+                    agent_result: AgentInvestigation | None = None
+                    if request.ask_agent and agent_configured(settings) and primary is not None:
+                        plan = next((item for item in remediations
+                                     if item.rule_id == primary.rule_id
+                                     and item.job_id == primary.job_id), None)
+                        # Only when the rules stopped short: unknown cause or no verified diff.
+                        if primary.confidence == "unknown" or plan is None or not plan.proposals:
+                            agent_notes: list[str] = []
+                            try:
+                                agent_result = await asyncio.wait_for(investigate(
+                                    settings, result, primary, plan,
+                                    read_source=source_reader(
+                                        provider, candidate.token, settings, result,
+                                    ),
+                                    notes=agent_notes,
+                                ), timeout=180)
+                            except TimeoutError:
+                                agent_notes.append("The investigation agent timed out.")
+                            result.notes.extend(
+                                note + " The local diagnosis above is unaffected."
+                                for note in agent_notes
+                            )
                     return InspectionResponse(
                         **result.model_dump(), submitted_url=request.url.strip(),
                         inspected_at=inspected_at, cached=cached is not None,
@@ -471,7 +498,7 @@ def create_inspection_router(
                         knowledge_saved=knowledge_saved, knowledge_summary=summary,
                         confirmed_resolutions=confirmed[:6],
                         remediations=remediations, corpus_matches=corpus_matches,
-                        cloud_assist=cloud_assist,
+                        cloud_assist=cloud_assist, agent_investigation=agent_result,
                     )
         raise HTTPException(
             last_status,
@@ -496,7 +523,7 @@ def create_inspection_router(
         if reference.kind != "repository":
             raise HTTPException(422, "A resolution must be scoped to the inspected project.")
         secrets = tuple(value for value in (
-            settings.configured_gitlab_token, settings.llm_api_key,
+            settings.configured_gitlab_token, settings.llm_api_key, settings.agent_api_key,
         ) if value)
         # Saved values also redact accidental credentials in user feedback, without exposing them.
         if vault.available:

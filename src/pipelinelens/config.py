@@ -33,6 +33,11 @@ class Settings:
     allow_private_context: bool
     configured_gitlab_token: str | None = field(default=None, repr=False)
     configured_gitlab_base_url: str = "https://gitlab.com"
+    agent_mode: str = "disabled"
+    agent_base_url: str = ""
+    agent_model: str = ""
+    agent_api_key: str | None = field(default=None, repr=False)
+    agent_max_turns: int = 8
 
 
 @lru_cache(maxsize=1)
@@ -54,4 +59,9 @@ def get_settings() -> Settings:
         configured_gitlab_base_url=os.getenv(
             "PIPELINELENS_GITLAB_BASE_URL", "https://gitlab.com"
         ).rstrip("/"),
+        agent_mode=os.getenv("PIPELINELENS_AGENT_MODE", "disabled").strip().lower(),
+        agent_base_url=os.getenv("PIPELINELENS_AGENT_BASE_URL", "").strip().rstrip("/"),
+        agent_model=os.getenv("PIPELINELENS_AGENT_MODEL", "").strip(),
+        agent_api_key=os.getenv("PIPELINELENS_AGENT_API_KEY") or None,
+        agent_max_turns=max(1, min(20, int(os.getenv("PIPELINELENS_AGENT_MAX_TURNS", "8")))),
     )

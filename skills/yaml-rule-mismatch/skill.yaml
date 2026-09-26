@@ -11,3 +11,7 @@ safe_actions:
 prohibited_actions:
   - Remove protected deployment conditions without review.
   - Make all jobs unconditional.
+investigate:
+  - Use get_ci_config to read the rules:/only:/except: block of the skipped job.
+  - Compare it with the pipeline ref, source and variables shown by list_jobs and the finding.
+  - Check list_changed_files for edits to .gitlab-ci.yml or included CI files.

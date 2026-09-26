@@ -19,6 +19,7 @@ class SkillPack:
     safe_actions: tuple[str, ...]
     prohibited_actions: tuple[str, ...]
     runbook: str
+    investigate: tuple[str, ...] = ()
 
     @property
     def evidence_id(self) -> str:
@@ -54,6 +55,7 @@ def load_skill_packs(directory: Path | None = None) -> list[SkillPack]:
                     str(item) for item in payload.get("prohibited_actions", [])
                 ),
                 runbook=runbook_path.read_text(encoding="utf-8") if runbook_path.exists() else "",
+                investigate=tuple(str(item) for item in payload.get("investigate", [])),
             )
         )
     return packs

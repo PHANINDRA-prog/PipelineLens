@@ -11,3 +11,7 @@ safe_actions:
 prohibited_actions:
   - Bypass artifact validation.
   - Publish an empty replacement artifact.
+investigate:
+  - Use list_jobs to find the upstream job that should have produced the artifact and whether it succeeded.
+  - Use get_ci_config to compare the upstream artifacts:paths and expire_in with the downstream needs/dependencies.
+  - Use search_log for the exact missing path to see whether it was ever uploaded.

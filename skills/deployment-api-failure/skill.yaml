@@ -13,3 +13,7 @@ safe_actions:
 prohibited_actions:
   - Retry indefinitely.
   - Trigger a production deployment automatically.
+investigate:
+  - Use get_log_window around the first HTTP error or timeout to see the request that failed.
+  - Use get_ci_config to read the deploy script, its retry settings and the target environment.
+  - Check list_jobs for earlier deploy jobs in the same pipeline that succeeded against the same target.

@@ -394,6 +394,66 @@ For a demo where you want to show the fully local, zero-egress story, leave this
 (`PIPELINELENS_LLM_MODE` defaults to `disabled`) — that is the recommended default, and the one
 used throughout this README's other examples.
 
+## Optional investigation agent
+
+Off by default. When the rules cannot establish a cause, or establish one but cannot produce a
+verified fix, you can opt in per analysis to let a model **investigate** instead of guessing
+from one snippet. The agent runs a bounded tool-calling loop with read-only tools:
+
+| Tool | Reads |
+| --- | --- |
+| `list_jobs` | Pipeline jobs, stages, statuses and failure reasons |
+| `get_log_window`, `search_log` | Numbered lines of a job's already-redacted log |
+| `get_ci_config` | The loaded CI configuration bundle |
+| `list_changed_files`, `list_repository_files` | Change list and repository tree |
+| `read_source` | A known repository file at the failed pipeline SHA (limited reads) |
+| `get_skill_pack` | The matching skill pack, including its `investigate:` steps |
+
+There is no tool that writes, reruns, approves, deploys or changes credentials. What the code
+enforces, independent of the prompt:
+
+- Every tool result is redacted, size-bounded and given an evidence id; the final answer must
+  cite at least one id and only ids actually issued in that run (one repair round is allowed).
+- A patch is kept only if it applies exactly to a file the agent read at the pipeline SHA, that
+  read needed no redaction, and the resulting diff contains nothing redaction would change. The
+  shown diff is regenerated from the applied result. Otherwise it is dropped with a reason.
+- Cause confidence is capped at 70 and fix confidence at 50 (25 without a verified patch).
+- Turn, tool-call, source-read and context budgets; a 180-second timeout; any failure adds a
+  note and leaves the local diagnosis untouched.
+
+Enable it locally with any OpenAI-compatible endpoint that supports tool calling:
+
+```dotenv
+PIPELINELENS_AGENT_MODE=openai-compatible
+# Local and zero-egress with Ollama:
+PIPELINELENS_AGENT_BASE_URL=http://localhost:11434/v1
+PIPELINELENS_AGENT_MODEL=qwen2.5-coder:14b
+# Or a hosted endpoint:
+# PIPELINELENS_AGENT_BASE_URL=https://api.openai.com/v1
+# PIPELINELENS_AGENT_MODEL=gpt-4.1-mini
+# PIPELINELENS_AGENT_API_KEY=your-own-key
+```
+
+Then check **Let an agent investigate if no verified fix is found** under **Connection &
+options**. The result appears in its own "Agent investigation" panel with its citations, tool
+trail, and any verified patch.
+
+### Editing what the model is told
+
+All prompts are plain files under `prompts/`, rendered with `$placeholder` substitution:
+
+| File | Used by |
+| --- | --- |
+| `agent_system.md` | Agent role, rules and required JSON answer |
+| `agent_task.md` | Per-finding task (`$rule_id`, `$evidence`, `$stop_reason`, ...) |
+| `diagnosis_system.md`, `diagnosis_user.md` | RAG diagnosis in `services/llm.py` |
+| `cloud_assist.md` | Gemini cloud assist |
+
+Point `PIPELINELENS_PROMPTS_DIR` at your own copy to customise them without editing the repo.
+Each agent result records a short hash of the prompt files it used (`prompt_versions`), so a
+changed prompt is visible in stored results. Per-category guidance belongs in each skill pack's
+`investigate:` list, which the agent reads through `get_skill_pack`.
+
 ## Skill packs and trustworthy learning
 
 Skill packs live under `skills/` and are version-controlled. Each pack contains detection prerequisites, safe diagnostic steps, and prohibited actions. The first five cover authentication failures, missing artifacts, test failures, YAML rule mismatches, and deployment/API failures.

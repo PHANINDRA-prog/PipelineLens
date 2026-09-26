@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -159,3 +160,25 @@ async def test_rag_orchestration_marks_a_valid_cited_llm_result_as_used(tmp_path
     assert snapshot.rag is not None
     assert snapshot.rag.llm_used is True
     assert "synthesized" in snapshot.rag.llm_message
+
+
+async def test_ollama_mode_reaches_the_ollama_chat_endpoint(monkeypatch) -> None:
+    import httpx
+
+    from pipelinelens.services import llm as llm_module
+
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"message": {"content": '{"ok": true}'}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(llm_module.httpx, "AsyncClient",
+                        lambda **kwargs: real_client(transport=httpx.MockTransport(handle)))
+    settings = replace(_settings(), llm_mode="ollama", llm_base_url="http://ollama.test")
+
+    content = await llm_module.HttpLlmClient(settings).complete_json("system", "user")
+
+    assert content == '{"ok": true}'
+    assert str(seen[0].url) == "http://ollama.test/api/chat"

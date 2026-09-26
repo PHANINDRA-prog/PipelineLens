@@ -324,7 +324,7 @@ def _initialize_state() -> None:
     defaults: dict[str, Any] = {
         "inspection_result": None, "submission_failed": False, "submission_error": None,
         "inspection_url": "", "connection_mode": "auto", "remember_token": False,
-        "remember_analysis": True, "ask_cloud_ai": False,
+        "remember_analysis": True, "ask_cloud_ai": False, "ask_agent": False,
         "force_refresh": False, "_clear_password": False, "export_preview": None,
         "export_reviewed": False, "local_notice": None,
     }
@@ -404,6 +404,7 @@ def _inspect_submission(status: dict[str, Any], url: str, token: str) -> None:
             "remember_analysis": bool(st.session_state.remember_analysis),
             "refresh": bool(st.session_state.force_refresh), "max_jobs": 5,
             "ask_cloud_ai": bool(st.session_state.ask_cloud_ai and status.get("cloud_assist_configured")),
+            "ask_agent": bool(st.session_state.ask_agent and status.get("agent_configured")),
         }
         if token:
             payload["token"] = token
@@ -481,6 +482,17 @@ def _render_input(status: dict[str, Any]) -> None:
             )
             if not status.get("cloud_assist_configured"):
                 st.caption("Cloud assist is not configured on this local API; analysis stays fully local.")
+            st.checkbox(
+                "Let an agent investigate if no verified fix is found (optional, off by default)",
+                key="ask_agent",
+                disabled=not status.get("agent_configured", False),
+                help=(
+                    "Runs a bounded, read-only investigation with the locally configured agent "
+                    "model. It can read the redacted job logs, CI files, changed files and source "
+                    "files at the failed commit; it cannot change anything. Its answer must cite "
+                    "what it read and is shown separately from the rule-based diagnosis."
+                ),
+            )
     # The disclosure stays visible even when the connection options are closed.
     st.caption(LOCAL_NOTES_NOTICE if st.session_state.remember_analysis else "Diagnostic note saving is off for the next analysis; existing notes stay on this device.")
     if submitted:
@@ -1223,6 +1235,44 @@ def _render_cloud_assist(result: dict[str, Any]) -> None:
     st.write(_md(_brief(summary, 1200)))
 
 
+def _render_agent_investigation(result: dict[str, Any]) -> None:
+    agent = result.get("agent_investigation")
+    summary = agent.get("summary") if isinstance(agent, dict) else None
+    if not isinstance(summary, str) or not summary.strip():
+        return
+    model = _brief(agent.get("model") or "agent", 60)
+    st.markdown(f"**Agent investigation ({_md(model)}) \u00b7 optional, model-generated**")
+    notice = agent.get("notice") if isinstance(agent.get("notice"), str) else "Model-generated; review independently."
+    st.caption(_md(_brief(notice, 300)))
+    st.write(_md(_brief(summary, 1200)))
+    cause = agent.get("likely_root_cause")
+    if isinstance(cause, str) and cause.strip():
+        st.markdown("**Likely root cause:** " + _md(_brief(cause, 1200)))
+    st.caption(
+        f"Agent cause confidence {int(agent.get('cause_confidence') or 0)}/100 \u00b7 "
+        f"fix confidence {int(agent.get('fix_confidence') or 0)}/100 (capped; not calibrated)"
+    )
+    patch = agent.get("patch")
+    if isinstance(patch, dict) and isinstance(patch.get("diff"), str):
+        st.markdown("**Proposed patch** \u00b7 " + _md(_brief(patch.get("basis") or "", 200)))
+        _exact_code(patch["diff"], language="diff")
+    elif isinstance(agent.get("patch_rejected_reason"), str):
+        st.caption("A patch was proposed but not shown: " + _md(_brief(agent["patch_rejected_reason"], 200)))
+    steps = [item for item in agent.get("next_steps") or [] if isinstance(item, str)]
+    if steps:
+        st.markdown("**Next checks**\n" + "\n".join(f"- {_md(_brief(item, 300))}" for item in steps[:8]))
+    with st.expander("What the agent read", expanded=False):
+        for item in agent.get("evidence") or []:
+            if isinstance(item, dict):
+                st.markdown(f"- `{_md(_brief(item.get('evidence_id'), 160))}` \u2014 {_md(_brief(item.get('explanation'), 400))}")
+        trail = [item for item in agent.get("steps") or [] if isinstance(item, dict)]
+        if trail:
+            st.caption("Tool calls: " + " \u2192 ".join(_md(_brief(item.get("tool"), 40)) for item in trail[:20]))
+        missing = [item for item in agent.get("missing_information") or [] if isinstance(item, str)]
+        if missing:
+            st.caption("Missing information: " + _md(_brief("; ".join(missing), 600)))
+
+
 def run() -> None:
     st.set_page_config(page_title="PipelineLens", page_icon="PL", layout="wide", initial_sidebar_state="collapsed")
     _initialize_state()
@@ -1240,6 +1290,7 @@ def run() -> None:
         _render_outcome(result)
         _render_answer(primary, remediation)
         _render_cloud_assist(result)
+        _render_agent_investigation(result)
         _render_retention(result)
         with st.expander("Evidence & details", expanded=False):
             _render_summary(result)

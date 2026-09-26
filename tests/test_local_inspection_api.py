@@ -1154,3 +1154,117 @@ def test_gemini_failure_adds_a_note_but_never_breaks_the_local_result(
     body = response.json()
     assert body["cloud_assist"] is None
     assert any("cloud assist" in note.lower() for note in body["notes"])
+
+def _unknown_finding_inspect_factory():
+    async def unknown_finding_inspect(
+        provider, token, repository, reference, settings, *, max_jobs=5,
+    ):
+        del provider, token, reference, max_jobs, settings
+        run = PipelineRun(
+            external_id=_RUN_ID, name="p", status="failed", commit_sha=_SHA,
+            web_url=_PIPELINE_URL,
+        )
+        return InspectionResult(
+            repository=repository, pipeline=run, selected_job=None,
+            resolved_url=_PIPELINE_URL, reference_kind="pipeline", project_key=_PROJECT_KEY,
+            jobs=[], findings=[Finding(
+                rule_id="job.insufficient_evidence", severity="error", category="build_failure",
+                title="Cause not established", explanation="No specific diagnostic was found.",
+                fix=["Inspect the complete trace."],
+                evidence=[FindingEvidence(text="generic non-zero exit", line=1)],
+                confidence="unknown",
+            )],
+            ci_config_access=CiConfigAccessReport(complete=True, entries=[]),
+            status="failed",
+        )
+    return unknown_finding_inspect
+
+
+def _canned_investigation():
+    from pipelinelens.services.agent import AgentCitation, AgentInvestigation
+
+    return AgentInvestigation(
+        model="fake-agent", rule_id="job.insufficient_evidence", failure_category="build_failure",
+        summary="A dependency pin changed.", likely_root_cause="requirements.txt pin.",
+        cause_confidence=50, fix_confidence=20,
+        evidence=[AgentCitation(evidence_id="finding:job.insufficient_evidence",
+                                explanation="Exit code only.")],
+    )
+
+
+def test_status_reports_agent_not_configured_by_default(local_api) -> None:
+    body = local_api.client.get(_PREFIX + "/status", headers=_LOCAL).json()
+    assert body["agent_configured"] is False
+
+
+def test_ask_agent_defaults_off_and_never_investigates(local_api, monkeypatch) -> None:
+    calls = []
+
+    async def fake_investigate(*args, **kwargs):
+        calls.append(args)
+        return _canned_investigation()
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", _unknown_finding_inspect_factory())
+    monkeypatch.setattr(inspection_api, "agent_configured", lambda settings: True)
+    monkeypatch.setattr(inspection_api, "investigate", fake_investigate)
+
+    response = local_api.inspect()
+
+    assert response.status_code == 200
+    assert response.json()["agent_investigation"] is None
+    assert calls == []
+
+
+def test_ask_agent_on_an_unresolved_finding_returns_a_separate_investigation(
+    local_api, monkeypatch,
+) -> None:
+    calls = []
+
+    async def fake_investigate(settings, result, finding, plan, *, read_source, notes):
+        calls.append((finding.rule_id, plan, read_source is not None))
+        return _canned_investigation()
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", _unknown_finding_inspect_factory())
+    monkeypatch.setattr(inspection_api, "agent_configured", lambda settings: True)
+    monkeypatch.setattr(inspection_api, "investigate", fake_investigate)
+
+    response = local_api.inspect(ask_agent=True)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_investigation"]["summary"] == "A dependency pin changed."
+    assert body["agent_investigation"]["auto_apply_allowed"] is False
+    assert body["findings"][0]["confidence"] == "unknown"  # Deterministic verdict unchanged.
+    assert len(calls) == 1 and calls[0][0] == "job.insufficient_evidence"
+    assert calls[0][2] is True  # A pinned-SHA source reader was provided.
+    _assert_no_secrets(response.text)
+
+
+def test_agent_failure_adds_a_note_and_keeps_the_local_result(local_api, monkeypatch) -> None:
+    async def failing_investigate(settings, result, finding, plan, *, read_source, notes):
+        notes.append("The investigation agent stopped: synthetic failure.")
+        return None
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", _unknown_finding_inspect_factory())
+    monkeypatch.setattr(inspection_api, "agent_configured", lambda settings: True)
+    monkeypatch.setattr(inspection_api, "investigate", failing_investigate)
+
+    response = local_api.inspect(ask_agent=True)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_investigation"] is None
+    assert any("synthetic failure" in note and "unaffected" in note for note in body["notes"])
+
+
+def test_ask_agent_unconfigured_makes_no_call(local_api, monkeypatch) -> None:
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("The agent must not run when it is not configured.")
+
+    monkeypatch.setattr(inspection_api, "inspect_gitlab", _unknown_finding_inspect_factory())
+    monkeypatch.setattr(inspection_api, "investigate", forbidden)
+
+    response = local_api.inspect(ask_agent=True)
+
+    assert response.status_code == 200
+    assert response.json()["agent_investigation"] is None

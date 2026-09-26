@@ -11,3 +11,7 @@ safe_actions:
 prohibited_actions:
   - Display a credential value.
   - Change credentials automatically.
+investigate:
+  - Use search_log for 401, 403 or expired to find which command and host rejected the credential.
+  - Use get_ci_config to see which variable name the failing command reads; never try to read its value.
+  - Check list_changed_files for changes to the job's variables or protected-branch settings.

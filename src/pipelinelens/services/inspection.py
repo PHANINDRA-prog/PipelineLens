@@ -117,7 +117,10 @@ def _bridge_problem(bridge: dict) -> bool:
 class _Scrubber:
     def __init__(self, origin: str, token: str, settings: Settings) -> None:
         self.origin = origin
-        secrets = {token, settings.configured_gitlab_token, settings.llm_api_key} - {None, ""}
+        secrets = {
+            token, settings.configured_gitlab_token, settings.llm_api_key,
+            settings.agent_api_key,
+        } - {None, ""}
         variants: set[str] = set()
         for secret in secrets:
             if secret is not None:

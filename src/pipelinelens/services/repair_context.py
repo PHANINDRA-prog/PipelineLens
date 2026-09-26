@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 
 from pipelinelens.config import Settings
 from pipelinelens.domain import AnalysisSnapshot, CiConfigFile
@@ -39,6 +40,36 @@ def _selected_findings(result: InspectionResult) -> list[Finding]:
             item.category in {"unknown", "no_failure_observed"},
         ),
     )[:MAX_REMEDIATIONS]
+
+
+def source_reader(
+    provider: GitLabProvider,
+    token: str,
+    settings: Settings,
+    result: InspectionResult,
+) -> Callable[[str], Awaitable[CiConfigFile | None]] | None:
+    """Read-only, redacted root-repository file reads pinned to the inspected pipeline SHA.
+
+    Returns ``None`` when the pipeline commit is not a full SHA. Each read re-checks path
+    and ref identity and the source size limit; failures return ``None`` rather than raise.
+    """
+    sha = result.pipeline.commit_sha if result.pipeline else None
+    if not sha or not _SHA.fullmatch(sha):
+        return None
+    scrub = _Scrubber(provider.web_base_url, token, settings)
+
+    async def read(path: str) -> CiConfigFile | None:
+        try:
+            source = await provider.fetch_file_at_ref(token, result.repository, path, sha)
+        except ProviderError:
+            return None
+        if source.path != path or source.ref != sha:
+            return None
+        if len(source.content.encode("utf-8", errors="replace")) > MAX_SOURCE_BYTES:
+            return None
+        return scrub.model(source)
+
+    return read
 
 
 async def enrich_remediations(

@@ -11,3 +11,8 @@ safe_actions:
 prohibited_actions:
   - Disable the test to unblock deployment.
   - Raise a timeout without measuring the operation.
+investigate:
+  - Use search_log for FAILED, AssertionError or Error to find the first failing test name.
+  - Use list_repository_files to locate the test file, then read_source around the failing test.
+  - Read fixtures or conftest/setup files the failing test depends on.
+  - Use list_changed_files to see whether the tested module changed in this commit.

@@ -13,6 +13,7 @@ from pipelinelens.services.diagnosis import (
     build_deterministic_diagnosis,
     validate_diagnosis_citations,
 )
+from pipelinelens.services.prompts import load_prompt
 from pipelinelens.services.retrieval import RetrievalBundle
 
 
@@ -59,6 +60,26 @@ class HttpLlmClient:
         content = response.json().get("choices", [{}])[0].get("message", {}).get("content")
         if not isinstance(content, str):
             raise LlmDiagnosisError("The LLM response did not contain JSON content.")
+        return content
+
+    async def _ollama(self, system_prompt: str, user_prompt: str) -> str:
+        base_url = self.settings.llm_base_url.rstrip("/")
+        endpoint = base_url if base_url.endswith("/api/chat") else f"{base_url}/api/chat"
+        payload = {
+            "model": self.settings.llm_model,
+            "stream": False,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(endpoint, json=payload)
+        response.raise_for_status()
+        content = response.json().get("message", {}).get("content")
+        if not isinstance(content, str):
+            raise LlmDiagnosisError("The Ollama response did not contain JSON content.")
         return content
 
 
@@ -133,62 +154,19 @@ async def get_llm_runtime_status(settings: Settings | None = None) -> LlmRuntime
         message="Unsupported LLM mode. Use disabled, ollama, or openai-compatible.",
     )
 
-    async def _ollama(self, system_prompt: str, user_prompt: str) -> str:
-        base_url = self.settings.llm_base_url.rstrip("/")
-        endpoint = base_url if base_url.endswith("/api/chat") else f"{base_url}/api/chat"
-        payload = {
-            "model": self.settings.llm_model,
-            "stream": False,
-            "format": "json",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(endpoint, json=payload)
-        response.raise_for_status()
-        content = response.json().get("message", {}).get("content")
-        if not isinstance(content, str):
-            raise LlmDiagnosisError("The Ollama response did not contain JSON content.")
-        return content
-
 
 def _system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are PipelineLens, an evidence-first CI failure analyst.",
-            "Return one valid JSON object only. Match this schema exactly:",
-            '{"failure_category":"string","confidence":0.0,"summary":"string",'
-            '"likely_root_cause":"string","evidence":[{"evidence_chunk_id":"string",'
-            '"source_type":"job_log|ci_yaml|historical_incident|skill_pack|local_corpus","explanation":"string"}],'
-            '"safe_next_steps":["string"],"missing_information":["string"],'
-            '"similar_incident_ids":["string"],"auto_remediation_allowed":false}',
-            (
-                "Make claims only when cited evidence supports them. "
-                "Every root-cause claim needs a citation."
-            ),
-            "Never reveal, infer, request, or fabricate secrets.",
-            (
-                "Never recommend automatic reruns, merges, approvals, deployments, "
-                "credential updates, or config changes."
-            ),
-            "If evidence is insufficient, say so explicitly.",
-        ]
-    )
+    return load_prompt("diagnosis_system").render()
 
 
 def _user_prompt(snapshot: AnalysisSnapshot, bundle: RetrievalBundle) -> str:
-    return "\n".join(
-        [
-            f"Selected provider: {snapshot.repository.provider}",
-            f"Selected repository: {snapshot.repository.display_name}",
-            f"Selected job: {snapshot.job.name}",
-            f"Deterministic category: {snapshot.fingerprint.category}",
-            f"Fingerprint: {snapshot.fingerprint.normalized_message}",
-            "Retrieved evidence follows. Cite only bracketed evidence IDs from this bundle.",
-            bundle.context,
-        ]
+    return load_prompt("diagnosis_user").render(
+        provider=snapshot.repository.provider,
+        repository=snapshot.repository.display_name,
+        job=snapshot.job.name,
+        category=snapshot.fingerprint.category,
+        fingerprint=snapshot.fingerprint.normalized_message,
+        context=bundle.context,
     )
 
 

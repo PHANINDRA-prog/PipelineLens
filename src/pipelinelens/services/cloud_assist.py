@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from pipelinelens.config import Settings
 from pipelinelens.services.findings import Finding
+from pipelinelens.services.prompts import PromptError, load_prompt
 from pipelinelens.services.redaction import redact_text
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -103,18 +104,14 @@ class CloudAssistProvider(Protocol):
 
 
 def _prompt(finding: Finding) -> str:
+    """Render ``prompts/cloud_assist.md`` from redacted fields. Raises ``PromptError``."""
     evidence = "\n".join(
         redact_text(item.text)[:MAX_EVIDENCE_CHARS]
         for item in finding.evidence[:MAX_EVIDENCE_ITEMS]
     )
-    text = (
-        "You are assisting with a CI/CD pipeline failure whose automated cause is "
-        "unknown. Suggest the most likely category of problem and one or two concrete, "
-        "safe checks a developer could run next. Do not invent file names, line "
-        "numbers, or commands that are not supported by the evidence below. Keep the "
-        "answer under 120 words and never include or ask for secrets.\n\n"
-        f"Rule: {finding.rule_id}\nTitle: {redact_text(finding.title)}\n"
-        f"Category: {finding.category}\nEvidence (already redacted):\n{evidence}"
+    text = load_prompt("cloud_assist").render(
+        rule_id=finding.rule_id, title=redact_text(finding.title),
+        category=finding.category, evidence=evidence,
     )
     return text[:MAX_PROMPT_CHARS]
 
@@ -145,8 +142,12 @@ class GeminiCloudAssistProvider:
             return None
         model = (settings.llm_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
+        try:
+            prompt = _prompt(finding)
+        except PromptError:
+            return None
         payload = {
-            "contents": [{"parts": [{"text": _prompt(finding)}]}],
+            "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 300},
         }
         headers = {

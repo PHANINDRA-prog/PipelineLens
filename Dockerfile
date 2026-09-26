@@ -15,6 +15,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY skills ./skills
+COPY prompts ./prompts
 COPY docker-entrypoint.sh /usr/local/bin/pipelinelens-entrypoint
 
 RUN pip install --no-cache-dir . \

@@ -293,6 +293,7 @@ def test_build_copies_required_readme_without_ignoring_it_or_copying_entire_cont
         "COPY pyproject.toml README.md ./",
         "COPY src ./src",
         "COPY skills ./skills",
+        "COPY prompts ./prompts",
         "COPY docker-entrypoint.sh /usr/local/bin/pipelinelens-entrypoint",
     ]
     assert not any(line.startswith("ADD ") for line in dockerfile.splitlines())

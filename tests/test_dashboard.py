@@ -514,6 +514,7 @@ def test_supported_url_kinds_use_new_inspection_endpoint(ui, suffix):
     assert api.posted()[0] == {
         "url": url, "connection": "auto", "remember_token": False,
         "remember_analysis": True, "refresh": False, "max_jobs": 5, "ask_cloud_ai": False,
+        "ask_agent": False,
     }
     assert at.text_input(key="inspection_url").value == url
     assert at.session_state.inspection_result["submitted_url"] == url
@@ -1710,3 +1711,31 @@ def test_client_rejects_nonlocal_or_credential_bearing_api_base_before_io(base):
 def test_client_rejects_unsafe_routes_before_io(path):
     with pytest.raises(ApiClientError, match="route is invalid"):
         PipelineLensApiClient("http://localhost:8000").get(path)
+
+def test_agent_option_is_sent_only_when_configured_and_its_answer_renders(ui):
+    at, api = ui
+    assert at.checkbox(key="ask_agent").disabled
+    api.status["agent_configured"] = True
+    api.result = {**api.result, "agent_investigation": {
+        "model": "local-agent", "summary": "total() subtracts one.",
+        "likely_root_cause": "src/calc.py returns sum(values) - 1.",
+        "cause_confidence": 70, "fix_confidence": 50,
+        "evidence": [{"evidence_id": "src:src/calc.py:1-6", "explanation": "Off by one."}],
+        "next_steps": ["Run the failing test locally."], "missing_information": [],
+        "patch": {"path": "src/calc.py", "diff": "--- a/src/calc.py\n+++ b/src/calc.py\n",
+                  "verified": True, "basis": "Applies exactly; not tested."},
+        "steps": [{"tool": "read_source", "arguments": "{}", "result_chars": 10}],
+        "notice": "Model-generated investigation.", "auto_apply_allowed": False,
+    }}
+    at.run()
+    at.checkbox(key="ask_agent").check()
+    submit(at)
+    assert api.posted()[-1]["ask_agent"] is True
+    assert not at.exception
+    markdown = "\n".join(item.value for item in at.markdown)
+    assert "Agent investigation" in markdown and "local\\-agent" in markdown
+    assert "Likely root cause:" in markdown
+    captions = [item.value for item in at.caption]
+    assert "Agent cause confidence 70/100 · fix confidence 50/100 (capped; not calibrated)" in (
+        captions)
+    assert any("--- a/src/calc.py" in block.value for block in at.code)
