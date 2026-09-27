@@ -414,6 +414,11 @@ def submit(at: AppTest, url: str = PIPELINE, token: str | None = None, *, enter=
     return at
 
 
+def session_values(at: AppTest) -> dict[str, Any]:
+    """Every user-visible session value; public API, stable across Streamlit versions."""
+    return {key: at.session_state[key] for key in at.session_state.keys()}
+
+
 def rendered_text(at: AppTest) -> str:
     kinds = ("markdown", "caption", "info", "warning", "error", "success", "subheader", "code")
     return "\n".join(str(item.value) for kind in kinds for item in at.get(kind))
@@ -487,7 +492,7 @@ def test_submission_retains_url_clears_only_password_and_keeps_settings(ui, ente
     assert api.posted() == [{
         "url": PIPELINE, "token": TOKEN, "connection": "request",
         "remember_token": True, "remember_analysis": True, "refresh": True, "max_jobs": 5,
-        "ask_cloud_ai": False,
+        "ask_cloud_ai": False, "ask_agent": False,
     }]
     assert at.text_input(key="inspection_url").value == PIPELINE
     assert at.text_input(key="read_only_token").value == ""
@@ -496,7 +501,7 @@ def test_submission_retains_url_clears_only_password_and_keeps_settings(ui, ente
     assert at.checkbox(key="force_refresh").value
     assert at.checkbox(key="remember_analysis").value
     assert not at.get("form")[0].proto.form.clear_on_submit
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
     assert TOKEN not in rendered_text(at)
     at.run()
     assert len(api.posted()) == 1
@@ -535,7 +540,7 @@ def test_save_is_opt_in_and_automatic_reuses_saved_connection_without_token(ui):
     assert "token" not in api.posted()[2]
     assert api.posted()[2]["remember_token"] is False
     assert "Saved Windows connection" in rendered_text(at)
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
 
 
 def test_unavailable_windows_vault_disables_save_and_never_sends_consent(ui):
@@ -564,7 +569,7 @@ def test_configured_selection_ignores_token_and_clears_it_after_submission(ui):
     assert not api.posted()[0]["remember_token"]
     assert api.posted()[0]["connection"] == "configured"
     assert at.text_input(key="read_only_token").value == ""
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
     at.radio(key="connection_mode").set_value("request").run()
     assert not at.text_input(key="read_only_token").disabled
     assert not at.checkbox(key="remember_token").disabled
@@ -579,7 +584,7 @@ def test_configured_mode_cannot_retain_a_token_pasted_into_the_url(ui):
     assert not api.posted()
     assert at.text_input(key="inspection_url").value == ""
     assert at.text_input(key="read_only_token").value == ""
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
     assert TOKEN not in rendered_text(at)
 
 
@@ -602,7 +607,7 @@ def test_invalid_selection_clears_stale_result_but_not_url(ui, url):
     assert not at.subheader
     assert "Previous results were cleared" in rendered_text(at)
     assert TOKEN not in rendered_text(at)
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
 
 
 @pytest.mark.parametrize("selection", ["missing-token", "different-host", "unconfigured"])
@@ -631,7 +636,7 @@ def test_failed_api_attempt_has_no_stale_result_or_echoed_secret(ui):
     assert at.session_state.inspection_result is None
     assert at.text_input(key="read_only_token").value == ""
     assert TOKEN not in rendered_text(at)
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
     del api.errors[f"{LOCAL}/inspect"]
     submit(at)
     assert not at.session_state.submission_failed
@@ -817,7 +822,7 @@ def test_summary_keeps_canonical_original_and_discloses_cache_age(ui):
     assert "37 seconds old" in text and "access rechecked" in text
     assert "2026-09-13T10:00:00+00:00" in text
     assert "1400 ms" in text
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
 
 
 def test_context_is_static_and_table_values_are_paginated_without_truncation(ui):
@@ -979,7 +984,7 @@ def test_retention_opt_out_is_sent_preserved_and_separate_from_token_consent(ui)
     assert "No diagnostic notes saved for this analysis" in answer_text(at)
     assert "Redacted observation saved locally" not in rendered_text(at)
     assert "existing notes stay on this device" in rendered_text(at)
-    assert TOKEN not in json.dumps(at.session_state.filtered_state)
+    assert TOKEN not in json.dumps(session_values(at), default=str)
     submit(at)
     assert api.posted()[1]["remember_analysis"] is False
     at.checkbox(key="remember_analysis").check()
